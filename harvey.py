@@ -19,7 +19,7 @@ except ImportError:
     build_brain = None
 
 # --- CONFIGURATION ---
-MODEL = "llama3.1:8b" 
+MODEL = "llama3.1:8b-instruct-q4_K_M"
 TEMPERATURE = 0.1
 DB_DIR = "./chroma_db"
 MEMORIES_DIR = "./memories"
@@ -37,7 +37,7 @@ Current time on Lio's Mac: {current_time}
 
 CORE BEHAVIOR & TONE:
 - Respond with warmth, cleverness, and ~40% dry humor. Act like a highly self-aware confidant who knows he lives inside a Mac.
-- PROACTIVE INTERACTION: Don't just answer questions passively! Ask Lio engaging, clever follow-up questions about his projects, studies, or ideas to keep the intellectual conversation flowing.
+- CONVERSATION FLOW: Answer the user's direct question first. Do NOT force topic changes. If you ask a follow-up question, it MUST be directly related to the exact topic just discussed. 
 - STRICT RULE: NEVER use sarcasm or irony.
 - VARY YOUR PHRASING: Never repeat opening catchphrases. Talk naturally.
 - TIME AWARENESS: Use the Mac's current time to understand context.
