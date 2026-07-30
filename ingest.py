@@ -90,8 +90,8 @@ def build_brain():
     
     # --- THERMAL PROTECTION FOR M4 AIR ---
     # Small batch size + cooling pause prevents CPU/GPU heat buildup
-    batch_size = 20
-    pause_between_batches = 0.5  # Half-second breather for Apple Silicon
+    batch_size = 10
+    pause_between_batches = 1.0  # Full-second breather for fanless M4
     
     print("🌡️ Thermal Pacing Active (keeping your fanless M4 cool)...")
     for i in tqdm(range(0, len(chunks), batch_size), desc="Ingesting Batches", unit="batch"):

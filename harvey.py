@@ -12,7 +12,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 
-# Import background ingestion so Harvey trains himself automatically
 try:
     from ingest import build_brain
 except ImportError:
@@ -24,7 +23,9 @@ TEMPERATURE = 0.1
 DB_DIR = "./chroma_db"
 MEMORIES_DIR = "./memories"
 
-# --- HARVEY'S PERSONALITY & IDENTITY ---
+# Global PID cache for lightweight metrics checking
+_OLLAMA_PID_CACHE = None
+
 SYSTEM_PROMPT = """You are Harvey, a witty, secure, and highly capable local AI assistant running offline on an M4 MacBook Air.
 
 IDENTITY & RELATIONS (STRICT):
@@ -80,7 +81,8 @@ def get_mac_thermal_state():
         return "Cool"
 
 def get_harvey_process_memory():
-    """Calculates active RAM and CPU usage specifically for Python and Ollama processes."""
+    """Calculates active RAM and CPU usage with process PID caching to minimize polling CPU usage."""
+    global _OLLAMA_PID_CACHE
     total_rss = 0
     cpu_percent = 0.0
     
@@ -91,14 +93,28 @@ def get_harvey_process_memory():
     except Exception:
         pass
 
-    for proc in psutil.process_iter(['name', 'memory_info', 'cpu_percent']):
+    if _OLLAMA_PID_CACHE is not None:
         try:
-            pname = proc.info['name'] or ""
-            if 'ollama' in pname.lower():
-                total_rss += proc.info['memory_info'].rss
-                cpu_percent += proc.info['cpu_percent'] or 0.0
+            oproc = psutil.Process(_OLLAMA_PID_CACHE)
+            if 'ollama' in oproc.name().lower():
+                total_rss += oproc.memory_info().rss
+                cpu_percent += oproc.cpu_percent(interval=None) or 0.0
+            else:
+                _OLLAMA_PID_CACHE = None
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+            _OLLAMA_PID_CACHE = None
+
+    if _OLLAMA_PID_CACHE is None:
+        for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
+            try:
+                pname = proc.info['name'] or ""
+                if 'ollama' in pname.lower():
+                    _OLLAMA_PID_CACHE = proc.info['pid']
+                    total_rss += proc.info['memory_info'].rss
+                    cpu_percent += proc.cpu_percent(interval=None) or 0.0
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
     ram_gb = total_rss / (1024 ** 3)
     return ram_gb, cpu_percent
@@ -150,7 +166,7 @@ def smart_memory_router(user_input, chat_history):
 
     try:
         existing_files = get_existing_memories_summary()
-        router_llm = ChatOllama(model=MODEL, temperature=0.1)
+        router_llm = ChatOllama(model=MODEL, temperature=0.1, keep_alive="10m", num_thread=4, num_gpu=99)
         
         prompt = f"""
         You are Harvey's Memory Router. Your job is to organize Lio's memories cleanly into a FEW broad categories.
@@ -273,7 +289,7 @@ with st.sidebar:
         st.metric("Harvey RAM", f"{harvey_ram_gb:.2f} GB")
         st.metric("Harvey CPU", f"{harvey_cpu:.1f}%")
         
-    st.caption(f"⚙️ Model Temp: `{TEMPERATURE}` | Context: `2048`")
+    st.caption(f"⚙️ Model Temp: `{TEMPERATURE}` | Context: `8192`")
     st.divider()
     
     st.header("🧠 Harvey's Memory Bank")
@@ -289,7 +305,15 @@ def load_chain():
     db = Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
     retriever = db.as_retriever(search_kwargs={"k": 6})
     
-    llm = ChatOllama(model=MODEL, temperature=TEMPERATURE, num_ctx=2048, keep_alive="0m")
+    # Metal GPU accelerated with limited CPU thread saturation for passive cooling
+    llm = ChatOllama(
+        model=MODEL, 
+        temperature=TEMPERATURE, 
+        num_ctx=8192, 
+        keep_alive="10m",
+        num_thread=4,
+        num_gpu=99
+    )
     prompt = ChatPromptTemplate.from_template(SYSTEM_PROMPT)
     
     def format_docs(docs):

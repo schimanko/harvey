@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Foundation
 import UniformTypeIdentifiers
+import UserNotifications
 
 // MARK: - Data Models
 
@@ -110,7 +111,7 @@ class ServerManager {
     }
 }
 
-// MARK: - View Model (Multi-File Support)
+// MARK: - View Model (Multi-File & Lightweight Polling)
 
 @MainActor
 class ChatViewModel: ObservableObject {
@@ -138,8 +139,13 @@ class ChatViewModel: ObservableObject {
 
     init() {
         ServerManager.shared.viewModel = self
+        requestNotificationPermission()
         loadSessionsFromDisk()
         startMetricsPolling()
+    }
+    
+    private func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
     
     var activeSession: ChatSession? {
@@ -196,7 +202,7 @@ class ChatViewModel: ObservableObject {
     
     func selectFilesForAnalysis() {
         let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true // Multi-file selection enabled
+        panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         
@@ -234,13 +240,21 @@ class ChatViewModel: ObservableObject {
         triggerNativeNotification("Debug logs copied to clipboard.")
     }
     
+    // Native UNUserNotificationCenter replaces subprocess osascript overhead
     func triggerNativeNotification(_ text: String) {
-        let task = Process()
-        task.launchPath = "/usr/bin/osascript"
-        let safeText = text.replacingOccurrences(of: "\"", with: "\\\"")
-        task.arguments = ["-e", "display notification \"\(safeText)\" with title \"Harvey\""]
-        try? task.run()
-        logDebug("Triggered Mac Notification: \(text)")
+        let content = UNMutableNotificationContent()
+        content.title = "Harvey"
+        content.body = text
+        content.sound = .default
+
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { [weak self] error in
+            if let error = error {
+                Task { @MainActor in
+                    self?.logDebug("Notification Error: \(error.localizedDescription)")
+                }
+            }
+        }
     }
     
     func startMetricsPolling() {
@@ -323,7 +337,14 @@ class ChatViewModel: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
-        var body: [String: Any] = ["question": prompt, "chat_history": ""]
+        let historyMessages = sessions[sessionIndex].messages.prefix(max(0, messageIndex - 1))
+        let recentHistory = historyMessages.suffix(16)
+        let formattedHistory = recentHistory.map { msg in
+            let roleName = msg.role == "user" ? "Lio" : "Harvey"
+            return "\(roleName): \(msg.content)"
+        }.joined(separator: "\n")
+        
+        var body: [String: Any] = ["question": prompt, "chat_history": formattedHistory]
         if !files.isEmpty {
             let filesPayload = files.map { ["name": $0.name, "content": $0.content] }
             body["files"] = filesPayload
@@ -658,7 +679,7 @@ struct MetricBadge: View {
     }
 }
 
-// MARK: - Message Bubble View (Renders Markdown & File Chips)
+// MARK: - Message Bubble View
 
 struct MessageBubbleView: View {
     let message: ChatMessage
@@ -697,7 +718,6 @@ struct MessageBubbleView: View {
                     .frame(maxWidth: 450, alignment: .leading)
                 }
 
-                // Render User Bubble with Multiple Gemini-style File Chips
                 if isUser {
                     VStack(alignment: .trailing, spacing: 6) {
                         if !message.attachedFiles.isEmpty {
@@ -735,7 +755,6 @@ struct MessageBubbleView: View {
                                 if block.isCode {
                                     CodeBlockContainer(language: block.language, code: block.text)
                                 } else {
-                                    // LocalizedStringKey renders rich Markdown bold, lists, and headers
                                     Text(LocalizedStringKey(block.text))
                                         .padding(.horizontal, 14)
                                         .padding(.vertical, 10)

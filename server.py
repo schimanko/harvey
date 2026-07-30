@@ -2,16 +2,23 @@ import os
 import json
 import re
 import psutil
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
+from datetime import datetime
+
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
 
 from harvey import (
     smart_memory_router,
     get_mac_thermal_state,
-    get_harvey_process_memory,
     MODEL,
     TEMPERATURE,
     DB_DIR
@@ -22,7 +29,57 @@ try:
 except ImportError:
     build_brain = None
 
-app = FastAPI()
+# Global pipeline objects initialized once at startup to prevent thermal spikes
+pipeline = {}
+ollama_pid_cache: Optional[int] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pipeline
+    # Load vector store and LLM pipeline ONCE into memory at app start
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    db = Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
+    retriever = db.as_retriever(search_kwargs={"k": 6})
+    
+    # 🔥 IN-CHAT THERMAL FIXES FOR M4 AIR:
+    llm = ChatOllama(
+        model=MODEL,
+        temperature=TEMPERATURE,
+        num_ctx=8192,
+        keep_alive="10m",
+        num_thread=2,       # Dropped to 2: Prevents CPU from fighting the GPU for bandwidth
+        num_gpu=99,
+        num_batch=128       # THE FIX: Paces the GPU when evaluating massive attached files
+    )
+    
+    prompt = ChatPromptTemplate.from_template(SYSTEM_PROMPT)
+
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    def optimize_search_query(x):
+        q = x["question"].lower()
+        if any(word in q for word in [" i ", " my ", " me ", " i'm ", " i am ", "degree", "education", "study"]):
+            return f"Lio profile education memories {x['question']}"
+        return x["question"]
+
+    chain = (
+        {
+            "context": RunnableLambda(optimize_search_query) | retriever | format_docs,
+            "chat_history": RunnableLambda(lambda x: x["chat_history"]),
+            "question": RunnableLambda(lambda x: x["question"]),
+            "current_time": RunnableLambda(lambda x: datetime.now().strftime("%A, %B %d, %Y at %I:%M %p"))
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    pipeline["chain"] = chain
+    yield
+    pipeline.clear()
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,12 +151,50 @@ def extract_and_save_files(text: str):
         saved_files.append(filename)
     return saved_files
 
+def get_harvey_process_memory_cached():
+    """Optimized process lookup with cached PID to prevent CPU spikes from full process scans."""
+    global ollama_pid_cache
+    total_rss = 0
+    cpu_percent = 0.0
+
+    try:
+        py_proc = psutil.Process(os.getpid())
+        total_rss += py_proc.memory_info().rss
+        cpu_percent += py_proc.cpu_percent(interval=None)
+    except Exception:
+        pass
+
+    if ollama_pid_cache is not None:
+        try:
+            oproc = psutil.Process(ollama_pid_cache)
+            if 'ollama' in oproc.name().lower():
+                total_rss += oproc.memory_info().rss
+                cpu_percent += oproc.cpu_percent(interval=None) or 0.0
+            else:
+                ollama_pid_cache = None
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            ollama_pid_cache = None
+
+    if ollama_pid_cache is None:
+        for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
+            try:
+                pname = proc.info['name'] or ""
+                if 'ollama' in pname.lower():
+                    ollama_pid_cache = proc.info['pid']
+                    total_rss += proc.info['memory_info'].rss
+                    cpu_percent += proc.cpu_percent(interval=None) or 0.0
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+    return (total_rss / (1024 ** 3)), cpu_percent
+
 @app.get("/api/metrics")
 async def get_metrics():
     sys_ram = psutil.virtual_memory()
     sys_cpu = psutil.cpu_percent(interval=None)
     thermal = get_mac_thermal_state()
-    harvey_ram_gb, harvey_cpu = get_harvey_process_memory()
+    harvey_ram_gb, harvey_cpu = get_harvey_process_memory_cached()
     
     return {
         "sys_ram_pct": f"{sys_ram.percent}%",
@@ -114,11 +209,18 @@ async def get_metrics():
 async def chat_endpoint(req: ChatRequest):
     full_prompt = req.question
     
-    # Handle Multi-File Context Insertion
+    # 🔥 Handle Multi-File Context with Thermal Safety Limits
     if req.files and len(req.files) > 0:
         file_context = ""
         for file in req.files:
-            file_context += f"\n\n--- [ Attached File: {file.name} ] ---\n```\n{file.content}\n```\n"
+            # STRICT TRUNCATION: Cap in-chat files to ~15,000 characters (~3,500 tokens).
+            # If a file is larger than this, it should be processed via ingest.py, not live chat.
+            safe_content = file.content[:15000]
+            if len(file.content) > 15000:
+                safe_content += "\n\n...[FILE TRUNCATED TO PREVENT MACBOOK OVERHEATING. USE INGESTION FOR FULL DOCUMENT.]..."
+                
+            file_context += f"\n\n--- [ Attached File: {file.name} ] ---\n```\n{safe_content}\n```\n"
+            
         full_prompt = file_context + "\nUser Question: " + req.question
 
     auto_fact, target_file = smart_memory_router(req.question, req.chat_history)
@@ -132,47 +234,12 @@ async def chat_endpoint(req: ChatRequest):
                 pass
         memory_toast = f"Harvey updated his memory regarding {auto_fact}"
 
-    from langchain_ollama import ChatOllama, OllamaEmbeddings
-    from langchain_chroma import Chroma
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.runnables import RunnableLambda
-    from langchain_core.output_parsers import StrOutputParser
-    from datetime import datetime
-    
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    db = Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
-    retriever = db.as_retriever(search_kwargs={"k": 6})
-    
-    # LOW-RAM & COOL CPU SETTINGS: num_thread=1, keep_alive=0m
-    llm = ChatOllama(
-        model=MODEL, 
-        temperature=TEMPERATURE, 
-        num_ctx=2048, 
-        keep_alive="0m", 
-        num_thread=1
-    )
-    prompt = ChatPromptTemplate.from_template(SYSTEM_PROMPT)
-    
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
-        
-    def optimize_search_query(x):
-        q = x["question"].lower()
-        if any(word in q for word in [" i ", " my ", " me ", " i'm ", " i am ", "degree", "education", "study"]):
-            return f"Lio profile education memories {x['question']}"
-        return x["question"]
-
-    chain = (
-        {
-            "context": RunnableLambda(optimize_search_query) | retriever | format_docs, 
-            "chat_history": RunnableLambda(lambda x: x["chat_history"]),
-            "question": RunnableLambda(lambda x: x["question"]),
-            "current_time": RunnableLambda(lambda x: datetime.now().strftime("%A, %B %d, %Y at %I:%M %p"))
-        }
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+    chain = pipeline.get("chain")
+    if not chain:
+        return StreamingResponse(
+            iter([f"data: {json.dumps({'error': 'Pipeline not initialized'})}\n\n"]),
+            media_type="text/event-stream"
+        )
     
     def event_stream():
         if memory_toast:
