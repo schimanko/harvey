@@ -57,7 +57,16 @@ async def lifespan(app: FastAPI):
     # Load vector store and LLM pipeline ONCE into memory at app start
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
     db = Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
-    retriever = db.as_retriever(search_kwargs={"k": 6})
+    
+    # Configure retriever with MMR search WITHOUT domain filtering so memories are included
+    retriever = db.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": 10,             # Number of total chunks sent to Harvey
+            "fetch_k": 30,       # Initial pool evaluated for relevance
+            "lambda_mult": 0.5   # 0.5 balances relevance with topic diversity
+        }
+    )
     
     # 🔥 IN-CHAT THERMAL FIXES FOR M4 AIR:
     llm = ChatOllama(
