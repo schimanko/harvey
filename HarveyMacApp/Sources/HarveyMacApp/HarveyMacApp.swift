@@ -906,6 +906,7 @@ struct MetricBadge: View {
     }
 }
 
+// MARK: - Message Bubble View
 struct MessageBubbleView: View {
     let message: ChatMessage
     var onRegenerate: () -> Void
@@ -995,6 +996,45 @@ struct MessageBubbleView: View {
                             .padding(8)
                     }
                 }
+                
+                // 🔥 RESTORED: Standard Message Actions (Copy, Save, Regenerate)
+                if !isUser && !message.content.isEmpty && !vm.isGenerating {
+                    HStack(spacing: 12) {
+                        Button(action: {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(message.content, forType: .string)
+                            vm.triggerNativeNotification("Copied answer to clipboard.")
+                        }) {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Copy Entire Answer")
+                        
+                        Button(action: {
+                            let panel = NSSavePanel()
+                            panel.allowedContentTypes = [.text, .plainText]
+                            panel.nameFieldStringValue = "Harvey_Output.md"
+                            if panel.runModal() == .OK, let url = panel.url {
+                                try? message.content.write(to: url, atomically: true, encoding: .utf8)
+                                vm.triggerNativeNotification("File saved.")
+                            }
+                        }) {
+                            Image(systemName: "square.and.arrow.down")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Save as File")
+                        
+                        Button(action: onRegenerate) {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Regenerate Answer")
+                    }
+                    .foregroundColor(.gray)
+                    .font(.caption)
+                    .padding(.top, 2)
+                    .padding(.leading, 6)
+                }
             }
             if !isUser { Spacer(minLength: 50) }
         }
@@ -1019,37 +1059,100 @@ struct MessageBubbleView: View {
     }
 }
 
+// 🔥 UPGRADED: Code Block Container (Mac Window Style)
 struct CodeBlockContainer: View {
     let language: String
     let code: String
     @State private var isCodeExpanded: Bool = true
+    @State private var isHovering: Bool = false
     @EnvironmentObject var vm: ChatViewModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            
+            // Header Bar
+            HStack(spacing: 8) {
+                // Mac OS Traffic Lights
+                HStack(spacing: 6) {
+                    Circle().fill(Color.red.opacity(0.8)).frame(width: 10, height: 10)
+                    Circle().fill(Color.yellow.opacity(0.8)).frame(width: 10, height: 10)
+                    Circle().fill(Color.green.opacity(0.8)).frame(width: 10, height: 10)
+                }
+                .padding(.trailing, 4)
+                
                 Text(language.capitalized.isEmpty ? "Code" : language.capitalized)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.white)
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(.gray)
+                
                 Spacer()
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 14)
-            .padding(.bottom, isCodeExpanded ? 10 : 14)
+                
+                // RESTORED: Code Actions
+                HStack(spacing: 12) {
+                    Button(action: {
+                        withAnimation(.spring()) { isCodeExpanded.toggle() }
+                    }) {
+                        Image(systemName: isCodeExpanded ? "chevron.up" : "chevron.down")
+                    }
+                    .buttonStyle(.plain)
+                    .help(isCodeExpanded ? "Collapse Code" : "Expand Code")
 
+                    Button(action: {
+                        let panel = NSSavePanel()
+                        panel.allowedContentTypes = [.text, .plainText]
+                        let ext = language.lowercased() == "bash" ? "sh" : (language.lowercased() == "python" ? "py" : "txt")
+                        panel.nameFieldStringValue = "snippet.\(ext)"
+                        if panel.runModal() == .OK, let url = panel.url {
+                            try? code.write(to: url, atomically: true, encoding: .utf8)
+                            vm.triggerNativeNotification("Snippet saved.")
+                        }
+                    }) {
+                        Image(systemName: "arrow.down.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Download Snippet")
+
+                    Button(action: {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(code, forType: .string)
+                        vm.triggerNativeNotification("Code copied to clipboard.")
+                    }) {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy Code")
+                }
+                .foregroundColor(.gray)
+                .opacity(isHovering ? 1.0 : 0.6)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color.black.opacity(0.4))
+            
+            // Code Area
             if isCodeExpanded {
+                Divider().background(Color.white.opacity(0.1))
                 ScrollView(.horizontal, showsIndicators: true) {
                     Text(code)
                         .font(.system(size: 13, design: .monospaced))
-                        .foregroundColor(Color.white.opacity(0.92))
-                        .padding(.horizontal, 18)
-                        .padding(.bottom, 16)
-                        .padding(.top, 2)
+                        .foregroundColor(Color(red: 0.85, green: 0.85, blue: 0.9)) // Soft white/blue tint
+                        .padding(14)
+                        .textSelection(.enabled) // Allows you to highlight specific lines
                 }
             }
         }
-        .background(Color(red: 0.08, green: 0.08, blue: 0.09))
-        .cornerRadius(18)
+        .background(Color(red: 0.12, green: 0.12, blue: 0.14)) // Sleek dark gray
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.2), radius: 5, x: 0, y: 2)
+        .padding(.vertical, 4)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                self.isHovering = hovering
+            }
+        }
     }
 }
 
