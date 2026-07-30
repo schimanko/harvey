@@ -26,6 +26,7 @@ struct ChatSession: Identifiable, Codable {
     var title: String
     var messages: [ChatMessage] = []
     var createdAt = Date()
+    var isPinned: Bool = false
 }
 
 struct HardwareMetricsData: Codable {
@@ -110,6 +111,7 @@ class ServerManager {
 // MARK: - View Model
 @MainActor
 class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
+    @Published var searchText: String = ""
     @Published var sessions: [ChatSession] = []
     @Published var activeSessionId: UUID?
     @Published var inputMessage: String = ""
@@ -382,7 +384,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         guard let sessionIndex = sessions.firstIndex(where: { $0.id == activeSessionId }) else { return }
         
         let userText = overridePrompt ?? inputMessage.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        if userText.isEmpty && attachedFiles.isEmpty { return }
+        if userText.isEmpty && attachedFiles.isEmpty && liveTranscription.isEmpty { return }
         
         let sentFiles = attachedFiles
         let fileNames = sentFiles.map { $0.name }
@@ -392,10 +394,15 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             attachedFiles.removeAll()
             
             if sessions[sessionIndex].messages.isEmpty {
-                let titleText = fileNames.first ?? userText
-                sessions[sessionIndex].title = String(titleText.prefix(25)) + (titleText.count > 25 ? "..." : "")
+                // 🔥 NEW: Set temporary title and ask Harvey to name it in the background
+                sessions[sessionIndex].title = "Thinking..."
+                sessions[sessionIndex].messages.append(ChatMessage(role: "user", content: userText, attachedFiles: fileNames))
+                Task {
+                    await generateTitle(for: sessions[sessionIndex].id, prompt: userText)
+                }
+            } else {
+                sessions[sessionIndex].messages.append(ChatMessage(role: "user", content: userText, attachedFiles: fileNames))
             }
-            sessions[sessionIndex].messages.append(ChatMessage(role: "user", content: userText, attachedFiles: fileNames))
         }
         
         sessions[sessionIndex].messages.append(ChatMessage(role: "assistant", content: ""))
@@ -531,6 +538,115 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             sessions[sessionIndex].messages[messageIndex].content = ""
         } else {
             sessions[sessionIndex].messages[messageIndex].content = cleanRaw
+        }
+    }
+    // MARK: - New Chat Features (Search, Pin, Auto-Name, Export)
+    
+    var filteredSessions: [ChatSession] {
+        var filtered = sessions
+        if !searchText.isEmpty {
+            filtered = filtered.filter { $0.title.localizedCaseInsensitiveContains(searchText) }
+        }
+        // Sort: Pinned first, then by date
+        return filtered.sorted {
+            if $0.isPinned == $1.isPinned {
+                return $0.createdAt > $1.createdAt
+            }
+            return $0.isPinned && !$1.isPinned
+        }
+    }
+    
+    func togglePin(for id: UUID) {
+        if let index = sessions.firstIndex(where: { $0.id == id }) {
+            sessions[index].isPinned.toggle()
+            saveSessionsToDisk()
+        }
+    }
+    
+    func generateTitle(for sessionId: UUID, prompt: String) async {
+        guard let url = URL(string: "http://127.0.0.1:8000/api/chat") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let body: [String: Any] = [
+            "question": "Provide a 2 to 4 word title for this prompt. Output ONLY the title, no quotes, no markdown, no other text: \(prompt)",
+            "chat_history": ""
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        
+        do {
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            if (response as? HTTPURLResponse)?.statusCode != 200 { return }
+            
+            var accumulated = ""
+            for try await line in bytes.lines {
+                if line.hasPrefix("data: ") {
+                    let jsonString = String(line.dropFirst(6))
+                    if let data = jsonString.data(using: .utf8),
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let chunk = json["chunk"] as? String {
+                        accumulated += chunk
+                    }
+                }
+            }
+            
+            // 🔥 FIXED: (?is) enables dot-matches-all so multi-line <thought> blocks are completely stripped
+            var cleanTitle = accumulated
+                .replacingOccurrences(of: "(?is)<(thought|summary|think)>.*?</\\1>", with: "", options: .regularExpression)
+                .replacingOccurrences(of: "\"", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            // Fallback safety if the model only output a thought
+            if cleanTitle.hasPrefix("<") || cleanTitle.isEmpty {
+                cleanTitle = String(prompt.prefix(22)) + (prompt.count > 22 ? "..." : "")
+            }
+            
+            let finalTitle = cleanTitle
+            await MainActor.run {
+                if let index = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                    self.sessions[index].title = finalTitle
+                    self.saveSessionsToDisk()
+                }
+            }
+        } catch { }
+    }
+    
+    func exportToMarkdown(session: ChatSession) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "\(session.title).md"
+        if panel.runModal() == .OK, let url = panel.url {
+            let text = session.messages.map { "**\($0.role == "user" ? "You" : "Harvey")**:\n\($0.content)" }.joined(separator: "\n\n---\n\n")
+            try? text.write(to: url, atomically: true, encoding: .utf8)
+            triggerNativeNotification("Exported chat to Markdown.")
+        }
+    }
+    
+    func exportToPDF(session: ChatSession) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.pdf]
+        panel.nameFieldStringValue = "\(session.title).pdf"
+        if panel.runModal() == .OK, let url = panel.url {
+            let text = session.messages.map { "\($0.role == "user" ? "You" : "Harvey"):\n\($0.content)" }.joined(separator: "\n\n")
+            let attrString = NSAttributedString(string: text, attributes: [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.textColor
+            ])
+            
+            let printInfo = NSPrintInfo.shared
+            printInfo.jobDisposition = .save
+            printInfo.dictionary().setObject(url, forKey: NSPrintInfo.AttributeKey.jobSavingURL as NSCopying)
+            
+            let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: printInfo.paperSize.width - 40, height: printInfo.paperSize.height - 40))
+            textView.textStorage?.setAttributedString(attrString)
+            
+            let printOp = NSPrintOperation(view: textView, printInfo: printInfo)
+            printOp.showsPrintPanel = false
+            printOp.showsProgressPanel = false
+            printOp.run()
+            
+            triggerNativeNotification("Exported chat to PDF.")
         }
     }
 }
@@ -675,11 +791,55 @@ struct VisualEffectView: NSViewRepresentable {
     }
 }
 
+// MARK: - Sidebar Item View (Clean SF Symbol Hover)
+struct SidebarItemView: View {
+    let session: ChatSession
+    @EnvironmentObject var vm: ChatViewModel
+    @Binding var renameTitle: String
+    @Binding var sessionToRename: UUID?
+    @Binding var showRenameAlert: Bool
+    
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack {
+            Text(session.isPinned ? "📌 \(session.title)" : session.title)
+                .lineLimit(1)
+            Spacer()
+            
+            if isHovering {
+                Menu {
+                    Button(session.isPinned ? "Unpin Chat" : "Pin Chat") {
+                        vm.togglePin(for: session.id)
+                    }
+                    Button("Rename") {
+                        renameTitle = session.title
+                        sessionToRename = session.id
+                        showRenameAlert = true
+                    }
+                    Button("Delete", role: .destructive) {
+                        vm.deleteSession(id: session.id)
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden) // 🔥 FIX: Removes the overlapping (.v.) arrow graphic
+                .frame(width: 20)
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovering = hovering
+        }
+    }
+}
 // MARK: - Main UI Layout
 struct MainView: View {
     @EnvironmentObject var vm: ChatViewModel
     
-    // 🔥 NEW: State variables to control the rename popup
     @State private var showRenameAlert = false
     @State private var sessionToRename: UUID? = nil
     @State private var renameTitle = ""
@@ -699,13 +859,17 @@ struct MainView: View {
                 }
                 .padding([.horizontal, .top])
 
-                List(vm.sessions.sorted(by: { $0.createdAt > $1.createdAt }), selection: $vm.activeSessionId) { session in
-                    // 🔥 REMOVED icon, leaving just the clean text
-                    Text(session.title)
-                        .lineLimit(1)
+                List(selection: $vm.activeSessionId) {
+                    ForEach(vm.filteredSessions) { session in
+                        SidebarItemView(
+                            session: session,
+                            renameTitle: $renameTitle,
+                            sessionToRename: $sessionToRename,
+                            showRenameAlert: $showRenameAlert
+                        )
                         .tag(session.id)
                         .contextMenu {
-                            // 🔥 ADDED: Rename button on right-click
+                            Button(session.isPinned ? "Unpin Chat" : "Pin Chat") { vm.togglePin(for: session.id) }
                             Button("Rename") {
                                 renameTitle = session.title
                                 sessionToRename = session.id
@@ -713,9 +877,11 @@ struct MainView: View {
                             }
                             Button("Delete", role: .destructive) { vm.deleteSession(id: session.id) }
                         }
+                    }
                 }
                 .listStyle(.sidebar)
-                // 🔥 ADDED: Native macOS rename alert with text field
+                // 🔥 NEW: Native macOS Search Bar for chats
+                .searchable(text: $vm.searchText, placement: .sidebar, prompt: "Search chats")
                 .alert("Rename Chat", isPresented: $showRenameAlert) {
                     TextField("New name", text: $renameTitle)
                     Button("Save") {
@@ -768,6 +934,44 @@ struct MainView: View {
                             .cornerRadius(6)
                         }
                         .buttonStyle(.plain)
+                        
+                        // 🔥 NEW: Top-Right Conversation Actions Menu
+                        // 🔥 Clean Top-Right Conversation Actions Menu
+                        Menu {
+                            Button(vm.activeSession?.isPinned == true ? "Unpin Chat" : "Pin Chat") {
+                                if let id = vm.activeSessionId { vm.togglePin(for: id) }
+                            }
+                            Button("Rename Chat") {
+                                if let session = vm.activeSession {
+                                    renameTitle = session.title
+                                    sessionToRename = session.id
+                                    showRenameAlert = true
+                                }
+                            }
+                            Menu("Download as...") {
+                                Button("Markdown (.md)") {
+                                    if let session = vm.activeSession { vm.exportToMarkdown(session: session) }
+                                }
+                                Button("PDF (.pdf)") {
+                                    if let session = vm.activeSession { vm.exportToPDF(session: session) }
+                                }
+                            }
+                            Divider()
+                            Button("Delete Chat", role: .destructive) {
+                                if let id = vm.activeSessionId { vm.deleteSession(id: id) }
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundColor(.primary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.gray.opacity(0.15))
+                                .cornerRadius(6)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden) // 🔥 FIX: Removes the overlapping (.v.) arrow graphic
+                        .frame(width: 32)
                     }
                     .padding()
                     .background(Color(NSColor.controlBackgroundColor))
@@ -803,14 +1007,12 @@ struct MainView: View {
 
                     Divider()
 
-                    // Debug Logs
                     if vm.isDebugMode {
                         DebugConsoleView()
                             .frame(height: 140)
                         Divider()
                     }
 
-                    // Input Bar with Call Mechanics & File Pills
                     VStack(spacing: 6) {
                         
                         if !vm.attachedFiles.isEmpty {
@@ -847,7 +1049,6 @@ struct MainView: View {
                             }
                             .buttonStyle(.plain)
 
-                            // Voice Dictation (Non-Call Mode)
                             Button(action: {
                                 if vm.isListening {
                                     vm.speechManager.stopListening()
@@ -883,7 +1084,6 @@ struct MainView: View {
                                     vm.sendMessage() 
                                 }
 
-                            // Call Button
                             Button(action: { 
                                 if vm.isCallMode {
                                     vm.endCall()
