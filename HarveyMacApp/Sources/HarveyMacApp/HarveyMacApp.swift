@@ -300,6 +300,17 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         if sessions.isEmpty { createNewSession() }
         saveSessionsToDisk()
     }
+
+    // 🔥 NEW: Function to handle renaming
+    func renameSession(id: UUID, newTitle: String) {
+        if let index = sessions.firstIndex(where: { $0.id == id }) {
+            let cleanTitle = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanTitle.isEmpty {
+                sessions[index].title = cleanTitle
+                saveSessionsToDisk()
+            }
+        }
+    }
     
     func selectFilesForAnalysis() {
         let panel = NSOpenPanel()
@@ -667,6 +678,11 @@ struct VisualEffectView: NSViewRepresentable {
 // MARK: - Main UI Layout
 struct MainView: View {
     @EnvironmentObject var vm: ChatViewModel
+    
+    // 🔥 NEW: State variables to control the rename popup
+    @State private var showRenameAlert = false
+    @State private var sessionToRename: UUID? = nil
+    @State private var renameTitle = ""
 
     var body: some View {
         NavigationSplitView {
@@ -683,21 +699,32 @@ struct MainView: View {
                 }
                 .padding([.horizontal, .top])
 
-                // 🔥 SORTED: Newest chats at the top, oldest at the bottom
                 List(vm.sessions.sorted(by: { $0.createdAt > $1.createdAt }), selection: $vm.activeSessionId) { session in
-                    HStack {
-                        Image(systemName: "bubble.left.and.bubble.right")
-                            .foregroundColor(.gray)
-                        Text(session.title)
-                            .lineLimit(1)
-                        Spacer()
-                    }
-                    .tag(session.id)
-                    .contextMenu {
-                        Button("Delete", role: .destructive) { vm.deleteSession(id: session.id) }
-                    }
+                    // 🔥 REMOVED icon, leaving just the clean text
+                    Text(session.title)
+                        .lineLimit(1)
+                        .tag(session.id)
+                        .contextMenu {
+                            // 🔥 ADDED: Rename button on right-click
+                            Button("Rename") {
+                                renameTitle = session.title
+                                sessionToRename = session.id
+                                showRenameAlert = true
+                            }
+                            Button("Delete", role: .destructive) { vm.deleteSession(id: session.id) }
+                        }
                 }
                 .listStyle(.sidebar)
+                // 🔥 ADDED: Native macOS rename alert with text field
+                .alert("Rename Chat", isPresented: $showRenameAlert) {
+                    TextField("New name", text: $renameTitle)
+                    Button("Save") {
+                        if let id = sessionToRename {
+                            vm.renameSession(id: id, newTitle: renameTitle)
+                        }
+                    }
+                    Button("Cancel", role: .cancel) { }
+                }
             }
             .frame(minWidth: 180, idealWidth: 200)
         } detail: {
@@ -776,15 +803,42 @@ struct MainView: View {
 
                     Divider()
 
-                    // 🔥 RESTORED & UPGRADED: Debug Logs
+                    // Debug Logs
                     if vm.isDebugMode {
                         DebugConsoleView()
                             .frame(height: 140)
                         Divider()
                     }
 
-                    // Input Bar with Call Mechanics
+                    // Input Bar with Call Mechanics & File Pills
                     VStack(spacing: 6) {
+                        
+                        if !vm.attachedFiles.isEmpty {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(vm.attachedFiles) { file in
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "doc.fill")
+                                                .foregroundColor(.accentColor)
+                                            Text(file.name)
+                                                .font(.caption)
+                                                .fontWeight(.medium)
+                                            Button(action: { vm.removeAttachedFile(id: file.id) }) {
+                                                Image(systemName: "xmark.circle.fill")
+                                                    .foregroundColor(.gray)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.accentColor.opacity(0.15))
+                                        .cornerRadius(8)
+                                    }
+                                }
+                            }
+                            .padding(.bottom, 4)
+                        }
+
                         HStack(spacing: 10) {
                             Button(action: { vm.selectFilesForAnalysis() }) {
                                 Image(systemName: "paperclip")
