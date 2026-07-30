@@ -112,6 +112,7 @@ class ServerManager {
 @MainActor
 class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var searchText: String = ""
+    @Published var showCodeSidebar: Bool = false
     @Published var sessions: [ChatSession] = []
     @Published var activeSessionId: UUID?
     @Published var inputMessage: String = ""
@@ -236,12 +237,11 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
     
-    // AVAudioPlayer Delegate: Triggers when Harvey stops speaking
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor in
             self.isSpeaking = false
             if self.isCallMode {
-                self.startListening() // Auto-resume listening in a call
+                self.startListening()
             }
         }
     }
@@ -275,7 +275,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             if !decoded.isEmpty {
                 self.sessions = decoded
                 
-                // 🔥 Always start with a blank conversation on launch
                 if let lastSession = self.sessions.last, lastSession.messages.isEmpty {
                     self.activeSessionId = lastSession.id
                 } else {
@@ -303,7 +302,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         saveSessionsToDisk()
     }
 
-    // 🔥 NEW: Function to handle renaming
     func renameSession(id: UUID, newTitle: String) {
         if let index = sessions.firstIndex(where: { $0.id == id }) {
             let cleanTitle = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -394,7 +392,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             attachedFiles.removeAll()
             
             if sessions[sessionIndex].messages.isEmpty {
-                // 🔥 NEW: Set temporary title and ask Harvey to name it in the background
                 sessions[sessionIndex].title = "Thinking..."
                 sessions[sessionIndex].messages.append(ChatMessage(role: "user", content: userText, attachedFiles: fileNames))
                 Task {
@@ -493,7 +490,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             scrollTrigger = UUID()
             saveSessionsToDisk()
             
-            // 🔥 Fetch Realistic Male TTS ONLY in Call Mode
             if isCallMode {
                 let finalAnswer = sessions[sessionIndex].messages[messageIndex].content
                 await speakText(finalAnswer)
@@ -540,14 +536,31 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             sessions[sessionIndex].messages[messageIndex].content = cleanRaw
         }
     }
-    // MARK: - New Chat Features (Search, Pin, Auto-Name, Export)
+
+    // MARK: - Utilities (Search, Pin, Auto-Name, Export, Parser)
+    func parseBlocks(raw: String) -> [ContentBlock] {
+        var blocks: [ContentBlock] = []
+        let components = raw.components(separatedBy: "```")
+        for (index, component) in components.enumerated() {
+            let trimmed = component.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            if index % 2 == 1 {
+                let lines = component.components(separatedBy: "\n")
+                let lang = lines.first?.trimmingCharacters(in: .whitespaces) ?? ""
+                let codeText = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                blocks.append(ContentBlock(isCode: true, language: lang.isEmpty ? "code" : lang, text: codeText.isEmpty ? component : codeText))
+            } else {
+                blocks.append(ContentBlock(isCode: false, language: "", text: trimmed))
+            }
+        }
+        return blocks.isEmpty ? [ContentBlock(isCode: false, language: "", text: raw)] : blocks
+    }
     
     var filteredSessions: [ChatSession] {
         var filtered = sessions
         if !searchText.isEmpty {
             filtered = filtered.filter { $0.title.localizedCaseInsensitiveContains(searchText) }
         }
-        // Sort: Pinned first, then by date
         return filtered.sorted {
             if $0.isPinned == $1.isPinned {
                 return $0.createdAt > $1.createdAt
@@ -564,12 +577,11 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
     
     func generateTitle(for sessionId: UUID, prompt: String) async {
-        guard let url = URL(string: "http://127.0.0.1:8000/api/chat") else { return }
+        guard let url = URL(string: "[http://127.0.0.1:8000/api/chat](http://127.0.0.1:8000/api/chat)") else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
-        // 🔥 FIX 1: Ruthlessly strict prompt
         let body: [String: Any] = [
             "question": "Summarize this request in exactly 2 to 4 words. Use Title Case. NO punctuation, NO quotes, NO conversational text. Output ONLY the short title. Request: \(prompt)",
             "chat_history": ""
@@ -597,7 +609,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 .replacingOccurrences(of: "\"", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             
-            // 🔥 FIX 2: Hard fallback and strict truncation (Max 35 characters)
             if cleanTitle.hasPrefix("<") || cleanTitle.isEmpty {
                 cleanTitle = String(prompt.prefix(25)) + "..."
             } else if cleanTitle.count > 35 {
@@ -665,7 +676,6 @@ struct HarveyApp: App {
                 MainView()
                     .environmentObject(vm)
                 
-                // 🔥 The Gemini-Style Call Overlay
                 if vm.isCallMode {
                     CallModeOverlay()
                         .environmentObject(vm)
@@ -690,15 +700,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Call Mode Overlay (Gemini Style)
+// MARK: - Call Mode Overlay
 struct CallModeOverlay: View {
     @EnvironmentObject var vm: ChatViewModel
     @State private var isPulsing = false
     
     var orbColor: Color {
-        if vm.isSpeaking { return .blue }      // Speaking
-        if vm.isGenerating { return .purple }  // Thinking
-        if vm.isListening { return .green }    // Listening
+        if vm.isSpeaking { return .blue }
+        if vm.isGenerating { return .purple }
+        if vm.isListening { return .green }
         return .gray
     }
     
@@ -711,7 +721,6 @@ struct CallModeOverlay: View {
     
     var body: some View {
         ZStack {
-            // Dark Frosted Background
             VisualEffectView(material: .hudWindow, blendingMode: .withinWindow)
                 .ignoresSafeArea()
             
@@ -719,19 +728,15 @@ struct CallModeOverlay: View {
             
             VStack {
                 Spacer()
-                
-                // Pulsing Orb
                 ZStack {
                     Circle()
                         .fill(orbColor.opacity(0.3))
                         .frame(width: 220, height: 220)
                         .scaleEffect(isPulsing ? 1.4 : 1.0)
-                    
                     Circle()
                         .fill(orbColor.opacity(0.6))
                         .frame(width: 160, height: 160)
                         .scaleEffect(isPulsing ? 1.2 : 1.0)
-                    
                     Circle()
                         .fill(orbColor)
                         .frame(width: 120, height: 120)
@@ -741,12 +746,10 @@ struct CallModeOverlay: View {
                 
                 Spacer().frame(height: 60)
                 
-                // Status Text
                 Text(vm.callStatusText)
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
                     .foregroundColor(.white)
                 
-                // Live Transcription
                 if !vm.liveTranscription.isEmpty {
                     Text(vm.liveTranscription)
                         .font(.system(size: 18, weight: .regular))
@@ -758,7 +761,6 @@ struct CallModeOverlay: View {
                 
                 Spacer()
                 
-                // End Call Button
                 Button(action: { vm.endCall() }) {
                     ZStack {
                         Circle()
@@ -793,7 +795,7 @@ struct VisualEffectView: NSViewRepresentable {
     }
 }
 
-// MARK: - Sidebar Item View (Clean SF Symbol Hover)
+// MARK: - Sidebar Item View
 struct SidebarItemView: View {
     let session: ChatSession
     @EnvironmentObject var vm: ChatViewModel
@@ -828,7 +830,7 @@ struct SidebarItemView: View {
                         .foregroundColor(.secondary)
                 }
                 .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden) // 🔥 FIX: Removes the overlapping (.v.) arrow graphic
+                .menuIndicator(.hidden)
                 .frame(width: 20)
             }
         }
@@ -838,6 +840,79 @@ struct SidebarItemView: View {
         }
     }
 }
+
+// MARK: - Code Snippets Sidebar
+struct CodeSidebarView: View {
+    @EnvironmentObject var vm: ChatViewModel
+    
+    struct ExtractedCode: Identifiable {
+        let id = UUID()
+        let language: String
+        let code: String
+        let date: Date
+    }
+    
+    var snippets: [ExtractedCode] {
+        guard let session = vm.activeSession else { return [] }
+        var result: [ExtractedCode] = []
+        for msg in session.messages where msg.role == "assistant" {
+            let blocks = vm.parseBlocks(raw: msg.content)
+            for block in blocks where block.isCode {
+                result.append(ExtractedCode(language: block.language, code: block.text, date: msg.timestamp))
+            }
+        }
+        // Sort newest first
+        return result.sorted { $0.date > $1.date }
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Generated Code")
+                    .font(.subheadline)
+                    .fontWeight(.bold)
+                    .foregroundColor(.primary)
+                Spacer()
+                Text("\(snippets.count)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.gray.opacity(0.2))
+                    .cornerRadius(4)
+            }
+            .padding()
+            
+            Divider()
+            
+            ScrollView {
+                LazyVStack(spacing: 20) {
+                    if snippets.isEmpty {
+                        Text("No code generated yet.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .padding(.top, 40)
+                    } else {
+                        ForEach(snippets) { snippet in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(snippet.date.formatted(date: .abbreviated, time: .standard))
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundColor(.secondary)
+                                    .padding(.leading, 4)
+                                
+                                CodeBlockContainer(language: snippet.language, code: snippet.code)
+                            }
+                        }
+                    }
+                }
+                .padding()
+            }
+        }
+        .frame(width: 320)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+}
+
 // MARK: - Main UI Layout
 struct MainView: View {
     @EnvironmentObject var vm: ChatViewModel
@@ -882,7 +957,6 @@ struct MainView: View {
                     }
                 }
                 .listStyle(.sidebar)
-                // 🔥 NEW: Native macOS Search Bar for chats
                 .searchable(text: $vm.searchText, placement: .sidebar, prompt: "Search chats")
                 .alert("Rename Chat", isPresented: $showRenameAlert) {
                     TextField("New name", text: $renameTitle)
@@ -897,186 +971,224 @@ struct MainView: View {
             .frame(minWidth: 180, idealWidth: 200)
         } detail: {
             ZStack(alignment: .top) {
-                VStack(spacing: 0) {
-                    HStack(spacing: 8) {
-                        Text(vm.activeSession?.title ?? "Chat")
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                            .foregroundColor(.secondary)
-                        
-                        Spacer()
-                        
-                        Button(action: { 
-                            vm.isMetricsMode.toggle()
-                            if vm.isMetricsMode { Task { await vm.fetchMetrics() } }
-                        }) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "cpu")
-                                Text("Metrics")
-                            }
-                            .font(.caption)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(vm.isMetricsMode ? Color.blue.opacity(0.2) : Color.gray.opacity(0.15))
-                            .foregroundColor(vm.isMetricsMode ? .blue : .primary)
-                            .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
-                        
-                        Button(action: { vm.isDebugMode.toggle() }) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "ladybug")
-                                Text("Debugging")
-                            }
-                            .font(.caption)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(vm.isDebugMode ? Color.orange.opacity(0.2) : Color.gray.opacity(0.15))
-                            .foregroundColor(vm.isDebugMode ? .orange : .primary)
-                            .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
-                        
-                        // 🔥 NEW: Top-Right Conversation Actions Menu
-                        // 🔥 Clean Top-Right Conversation Actions Menu
-                        Menu {
-                            Button(vm.activeSession?.isPinned == true ? "Unpin Chat" : "Pin Chat") {
-                                if let id = vm.activeSessionId { vm.togglePin(for: id) }
-                            }
-                            Button("Rename Chat") {
-                                if let session = vm.activeSession {
-                                    renameTitle = session.title
-                                    sessionToRename = session.id
-                                    showRenameAlert = true
-                                }
-                            }
-                            Menu("Download as...") {
-                                Button("Markdown (.md)") {
-                                    if let session = vm.activeSession { vm.exportToMarkdown(session: session) }
-                                }
-                                Button("PDF (.pdf)") {
-                                    if let session = vm.activeSession { vm.exportToPDF(session: session) }
-                                }
-                            }
-                            Divider()
-                            Button("Delete Chat", role: .destructive) {
-                                if let id = vm.activeSessionId { vm.deleteSession(id: id) }
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis")
-                                .font(.system(size: 14, weight: .medium))
+                HStack(spacing: 0) {
+                    VStack(spacing: 0) {
+                        HStack(spacing: 8) {
+                            Text(vm.activeSession?.title ?? "Chat")
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
                                 .foregroundColor(.primary)
+                            
+                            Button(action: { 
+                                vm.isMetricsMode.toggle()
+                                if vm.isMetricsMode { Task { await vm.fetchMetrics() } }
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "cpu")
+                                    Text("Metrics")
+                                }
+                                .font(.caption)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
-                                .background(Color.gray.opacity(0.15))
+                                .background(vm.isMetricsMode ? Color.blue.opacity(0.2) : Color.gray.opacity(0.15))
+                                .foregroundColor(vm.isMetricsMode ? .blue : .primary)
                                 .cornerRadius(6)
-                        }
-                        .menuStyle(.borderlessButton)
-                        .menuIndicator(.hidden) // 🔥 FIX: Removes the overlapping (.v.) arrow graphic
-                        .frame(width: 32)
-                    }
-                    .padding()
-                    .background(Color(NSColor.controlBackgroundColor))
-
-                    Divider()
-
-                    if vm.isMetricsMode {
-                        HardwareMetricsView()
-                        Divider()
-                    }
-
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(spacing: 16) {
-                                if let messages = vm.activeSession?.messages {
-                                    ForEach(messages) { msg in
-                                        MessageBubbleView(message: msg) {
-                                            vm.regenerateResponse(for: msg.id)
-                                        }
-                                        .id(msg.id)
-                                    }
-                                }
-                                Color.clear.frame(height: 1).id("bottomAnchor")
-                            }
-                            .padding()
-                        }
-                        .onChange(of: vm.scrollTrigger) { _, _ in
-                            withAnimation(.easeOut(duration: 0.1)) {
-                                proxy.scrollTo("bottomAnchor", anchor: .bottom)
-                            }
-                        }
-                    }
-
-                    Divider()
-
-                    if vm.isDebugMode {
-                        DebugConsoleView()
-                            .frame(height: 140)
-                        Divider()
-                    }
-
-                    VStack(spacing: 6) {
-                        
-                        if !vm.attachedFiles.isEmpty {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 8) {
-                                    ForEach(vm.attachedFiles) { file in
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "doc.fill")
-                                                .foregroundColor(.accentColor)
-                                            Text(file.name)
-                                                .font(.caption)
-                                                .fontWeight(.medium)
-                                            Button(action: { vm.removeAttachedFile(id: file.id) }) {
-                                                Image(systemName: "xmark.circle.fill")
-                                                    .foregroundColor(.gray)
-                                            }
-                                            .buttonStyle(.plain)
-                                        }
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .background(Color.accentColor.opacity(0.15))
-                                        .cornerRadius(8)
-                                    }
-                                }
-                            }
-                            .padding(.bottom, 4)
-                        }
-
-                        HStack(spacing: 10) {
-                            Button(action: { vm.selectFilesForAnalysis() }) {
-                                Image(systemName: "paperclip")
-                                    .font(.system(size: 18))
-                                    .foregroundColor(.secondary)
                             }
                             .buttonStyle(.plain)
-
+                            .padding(.leading, 8)
+                            
+                            Button(action: { vm.isDebugMode.toggle() }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "ladybug")
+                                    Text("Debugging")
+                                }
+                                .font(.caption)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(vm.isDebugMode ? Color.orange.opacity(0.2) : Color.gray.opacity(0.15))
+                                .foregroundColor(vm.isDebugMode ? .orange : .primary)
+                                .cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                            
+                            Spacer()
+                            
                             Button(action: {
-                                if vm.isListening {
-                                    vm.speechManager.stopListening()
-                                    vm.isListening = false
-                                    if !vm.liveTranscription.isEmpty {
-                                        vm.inputMessage = vm.liveTranscription
-                                        vm.liveTranscription = ""
-                                        vm.sendMessage()
-                                    }
-                                } else {
-                                    vm.startListening()
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    vm.showCodeSidebar.toggle()
                                 }
                             }) {
-                                Image(systemName: vm.isListening && !vm.isCallMode ? "mic.fill" : "mic")
-                                    .font(.system(size: 18))
-                                    .foregroundColor(vm.isListening && !vm.isCallMode ? .red : .secondary)
+                                Image(systemName: "sidebar.right")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(vm.showCodeSidebar ? .accentColor : .primary)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(vm.showCodeSidebar ? Color.accentColor.opacity(0.15) : Color.gray.opacity(0.15))
+                                    .cornerRadius(6)
                             }
                             .buttonStyle(.plain)
+                            
+                            Menu {
+                                Button(vm.activeSession?.isPinned == true ? "Unpin Chat" : "Pin Chat") {
+                                    if let id = vm.activeSessionId { vm.togglePin(for: id) }
+                                }
+                                Button("Rename Chat") {
+                                    if let session = vm.activeSession {
+                                        renameTitle = session.title
+                                        sessionToRename = session.id
+                                        showRenameAlert = true
+                                    }
+                                }
+                                Menu("Download as...") {
+                                    Button("Markdown (.md)") {
+                                        if let session = vm.activeSession { vm.exportToMarkdown(session: session) }
+                                    }
+                                    Button("PDF (.pdf)") {
+                                        if let session = vm.activeSession { vm.exportToPDF(session: session) }
+                                    }
+                                }
+                                Divider()
+                                Button("Delete Chat", role: .destructive) {
+                                    if let id = vm.activeSessionId { vm.deleteSession(id: id) }
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(.primary)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.gray.opacity(0.15))
+                                    .cornerRadius(6)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .menuIndicator(.hidden)
+                            .frame(width: 32)
+                        }
+                        .padding()
+                        .background(Color(NSColor.controlBackgroundColor))
 
-                            TextField("Ask Harvey anything...", text: vm.isListening ? $vm.liveTranscription : $vm.inputMessage, axis: .vertical)
-                                .textFieldStyle(.plain)
-                                .padding(10)
-                                .background(Color.gray.opacity(0.12))
-                                .cornerRadius(10)
-                                .lineLimit(1...5)
-                                .onSubmit { 
+                        Divider()
+
+                        if vm.isMetricsMode {
+                            HardwareMetricsView()
+                            Divider()
+                        }
+
+                        ScrollViewReader { proxy in
+                            ScrollView {
+                                LazyVStack(spacing: 16) {
+                                    if let messages = vm.activeSession?.messages {
+                                        ForEach(messages) { msg in
+                                            MessageBubbleView(message: msg) {
+                                                vm.regenerateResponse(for: msg.id)
+                                            }
+                                            .id(msg.id)
+                                        }
+                                    }
+                                    Color.clear.frame(height: 1).id("bottomAnchor")
+                                }
+                                .padding()
+                            }
+                            .onChange(of: vm.scrollTrigger) { _, _ in
+                                withAnimation(.easeOut(duration: 0.1)) {
+                                    proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                                }
+                            }
+                        }
+
+                        Divider()
+
+                        if vm.isDebugMode {
+                            DebugConsoleView()
+                                .frame(height: 140)
+                            Divider()
+                        }
+
+                        VStack(spacing: 6) {
+                            if !vm.attachedFiles.isEmpty {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 8) {
+                                        ForEach(vm.attachedFiles) { file in
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "doc.fill")
+                                                    .foregroundColor(.accentColor)
+                                                Text(file.name)
+                                                    .font(.caption)
+                                                    .fontWeight(.medium)
+                                                Button(action: { vm.removeAttachedFile(id: file.id) }) {
+                                                    Image(systemName: "xmark.circle.fill")
+                                                        .foregroundColor(.gray)
+                                                }
+                                                .buttonStyle(.plain)
+                                            }
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(Color.accentColor.opacity(0.15))
+                                            .cornerRadius(8)
+                                        }
+                                    }
+                                }
+                                .padding(.bottom, 4)
+                            }
+
+                            HStack(spacing: 10) {
+                                Button(action: { vm.selectFilesForAnalysis() }) {
+                                    Image(systemName: "paperclip")
+                                        .font(.system(size: 18))
+                                        .foregroundColor(.secondary)
+                                }
+                                .buttonStyle(.plain)
+
+                                Button(action: {
+                                    if vm.isListening {
+                                        vm.speechManager.stopListening()
+                                        vm.isListening = false
+                                        if !vm.liveTranscription.isEmpty {
+                                            vm.inputMessage = vm.liveTranscription
+                                            vm.liveTranscription = ""
+                                            vm.sendMessage()
+                                        }
+                                    } else {
+                                        vm.startListening()
+                                    }
+                                }) {
+                                    Image(systemName: vm.isListening && !vm.isCallMode ? "mic.fill" : "mic")
+                                        .font(.system(size: 18))
+                                        .foregroundColor(vm.isListening && !vm.isCallMode ? .red : .secondary)
+                                }
+                                .buttonStyle(.plain)
+
+                                TextField("Ask Harvey anything...", text: vm.isListening ? $vm.liveTranscription : $vm.inputMessage, axis: .vertical)
+                                    .textFieldStyle(.plain)
+                                    .padding(10)
+                                    .background(Color.gray.opacity(0.12))
+                                    .cornerRadius(10)
+                                    .lineLimit(1...5)
+                                    .onSubmit { 
+                                        if vm.isListening {
+                                            vm.speechManager.stopListening()
+                                            vm.isListening = false
+                                            vm.inputMessage = vm.liveTranscription
+                                            vm.liveTranscription = ""
+                                        }
+                                        vm.sendMessage() 
+                                    }
+
+                                Button(action: { 
+                                    if vm.isCallMode {
+                                        vm.endCall()
+                                    } else {
+                                        vm.startCall()
+                                    }
+                                }) {
+                                    Image(systemName: "phone.circle.fill")
+                                        .font(.system(size: 24))
+                                        .foregroundColor(.green)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Call Harvey")
+
+                                Button(action: { 
                                     if vm.isListening {
                                         vm.speechManager.stopListening()
                                         vm.isListening = false
@@ -1084,41 +1196,24 @@ struct MainView: View {
                                         vm.liveTranscription = ""
                                     }
                                     vm.sendMessage() 
+                                }) {
+                                    Image(systemName: "arrow.up.circle.fill")
+                                        .font(.system(size: 24))
+                                        .foregroundColor((vm.inputMessage.isEmpty && vm.attachedFiles.isEmpty && vm.liveTranscription.isEmpty) ? .gray : .accentColor)
                                 }
-
-                            Button(action: { 
-                                if vm.isCallMode {
-                                    vm.endCall()
-                                } else {
-                                    vm.startCall()
-                                }
-                            }) {
-                                Image(systemName: "phone.circle.fill")
-                                    .font(.system(size: 24))
-                                    .foregroundColor(.green)
+                                .buttonStyle(.plain)
+                                .disabled(((vm.inputMessage.isEmpty && vm.liveTranscription.isEmpty) && vm.attachedFiles.isEmpty) || vm.isGenerating)
                             }
-                            .buttonStyle(.plain)
-                            .help("Call Harvey")
-
-                            Button(action: { 
-                                if vm.isListening {
-                                    vm.speechManager.stopListening()
-                                    vm.isListening = false
-                                    vm.inputMessage = vm.liveTranscription
-                                    vm.liveTranscription = ""
-                                }
-                                vm.sendMessage() 
-                            }) {
-                                Image(systemName: "arrow.up.circle.fill")
-                                    .font(.system(size: 24))
-                                    .foregroundColor((vm.inputMessage.isEmpty && vm.attachedFiles.isEmpty && vm.liveTranscription.isEmpty) ? .gray : .accentColor)
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(((vm.inputMessage.isEmpty && vm.liveTranscription.isEmpty) && vm.attachedFiles.isEmpty) || vm.isGenerating)
                         }
+                        .padding()
+                        .background(Color(NSColor.windowBackgroundColor))
                     }
-                    .padding()
-                    .background(Color(NSColor.windowBackgroundColor))
+                    
+                    if vm.showCodeSidebar {
+                        Divider()
+                        CodeSidebarView()
+                            .transition(.move(edge: .trailing))
+                    }
                 }
             }
         }
@@ -1172,19 +1267,14 @@ struct MessageBubbleView: View {
     
     var isUser: Bool { message.role == "user" }
     
-    // 🔥 NEW: Advanced Markdown parser to highlight inline `code`
     private func styleInlineCode(_ raw: String) -> AttributedString {
         do {
-            // Parse the raw text into a rich AttributedString
             var attrString = try AttributedString(
                 markdown: raw,
                 options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
             )
-            
-            // Scan the text for any parts marked as inline code
             for run in attrString.runs {
                 if let intent = run.inlinePresentationIntent, intent.contains(.code) {
-                    // Apply the gray highlight and monospaced font
                     attrString[run.range].backgroundColor = Color.gray.opacity(0.2)
                     attrString[run.range].font = .system(size: 13, design: .monospaced)
                     attrString[run.range].foregroundColor = Color.primary
@@ -1192,7 +1282,7 @@ struct MessageBubbleView: View {
             }
             return attrString
         } catch {
-            return AttributedString(raw) // Fallback if markdown is malformed
+            return AttributedString(raw)
         }
     }
 
@@ -1257,18 +1347,17 @@ struct MessageBubbleView: View {
                 } else {
                     if !message.content.isEmpty {
                         VStack(alignment: .leading, spacing: 10) {
-                            ForEach(parseBlocks(raw: message.content)) { block in
+                            ForEach(vm.parseBlocks(raw: message.content)) { block in
                                 if block.isCode {
                                     CodeBlockContainer(language: block.language, code: block.text)
                                 } else {
-                                    // 🔥 UPGRADED: Uses AttributedString to render the highlighted inline code
                                     Text(styleInlineCode(block.text))
                                         .padding(.horizontal, 14)
                                         .padding(.vertical, 10)
                                         .foregroundColor(.primary)
                                         .background(Color.gray.opacity(0.18))
                                         .cornerRadius(16)
-                                        .textSelection(.enabled) // Allows text highlighting!
+                                        .textSelection(.enabled)
                                 }
                             }
                         }
@@ -1320,24 +1409,6 @@ struct MessageBubbleView: View {
             if !isUser { Spacer(minLength: 50) }
         }
     }
-    
-    private func parseBlocks(raw: String) -> [ContentBlock] {
-        var blocks: [ContentBlock] = []
-        let components = raw.components(separatedBy: "```")
-        for (index, component) in components.enumerated() {
-            let trimmed = component.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            if index % 2 == 1 {
-                let lines = component.components(separatedBy: "\n")
-                let lang = lines.first?.trimmingCharacters(in: .whitespaces) ?? ""
-                let codeText = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-                blocks.append(ContentBlock(isCode: true, language: lang.isEmpty ? "code" : lang, text: codeText.isEmpty ? component : codeText))
-            } else {
-                blocks.append(ContentBlock(isCode: false, language: "", text: trimmed))
-            }
-        }
-        return blocks.isEmpty ? [ContentBlock(isCode: false, language: "", text: raw)] : blocks
-    }
 }
 
 // 🔥 UPGRADED: Code Block Container with Native Syntax Highlighting
@@ -1348,26 +1419,38 @@ struct CodeBlockContainer: View {
     @State private var isHovering: Bool = false
     @EnvironmentObject var vm: ChatViewModel
     
-    // 🎨 Native Regex Syntax Highlighter
+    var extractedFileName: String {
+        let lines = code.components(separatedBy: .newlines)
+        if let firstLine = lines.first {
+            let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("//") || trimmed.hasPrefix("#") || trimmed.hasPrefix("<!--") {
+                let name = trimmed.replacingOccurrences(of: "//", with: "")
+                                  .replacingOccurrences(of: "#", with: "")
+                                  .replacingOccurrences(of: "<!--", with: "")
+                                  .replacingOccurrences(of: "-->", with: "")
+                                  .trimmingCharacters(in: .whitespaces)
+                if name.contains(".") { return name }
+            }
+        }
+        return ""
+    }
+    
     private func colorizeCode(_ code: String) -> AttributedString {
         var attr = AttributedString(code)
         attr.font = .system(size: 13, design: .monospaced)
-        attr.foregroundColor = Color(red: 0.85, green: 0.85, blue: 0.9) // Default text
+        attr.foregroundColor = Color(red: 0.85, green: 0.85, blue: 0.9)
         
         let nsString = code as NSString
+        let keywordColor = Color(red: 0.98, green: 0.45, blue: 0.65)
+        let stringColor = Color(red: 0.95, green: 0.78, blue: 0.45)
+        let commentColor = Color(red: 0.45, green: 0.75, blue: 0.45)
+        let numberColor = Color(red: 0.55, green: 0.75, blue: 0.95)
         
-        // IDE Colors
-        let keywordColor = Color(red: 0.98, green: 0.45, blue: 0.65) // Pink
-        let stringColor = Color(red: 0.95, green: 0.78, blue: 0.45)  // Yellow
-        let commentColor = Color(red: 0.45, green: 0.75, blue: 0.45) // Green
-        let numberColor = Color(red: 0.55, green: 0.75, blue: 0.95)  // Light Blue
-        
-        // Common language patterns (Supports Swift, Python, JS, C++)
         let patterns: [(String, Color)] = [
-            ("//.*|#.*", commentColor), // Comments
-            ("\".*?\"|'.*?'", stringColor), // Strings
-            ("\\b\\d+(\\.\\d+)?\\b", numberColor), // Numbers
-            ("\\b(import|func|def|class|struct|let|var|if|else|return|guard|for|in|while|switch|case|default|self|true|false|nil|None|async|await|try|catch|print)\\b", keywordColor) // Keywords
+            ("//.*|#.*", commentColor),
+            ("\".*?\"|'.*?'", stringColor),
+            ("\\b\\d+(\\.\\d+)?\\b", numberColor),
+            ("\\b(import|func|def|class|struct|let|var|if|else|return|guard|for|in|while|switch|case|default|self|true|false|nil|None|async|await|try|catch|print)\\b", keywordColor)
         ]
         
         for (pattern, color) in patterns {
@@ -1386,8 +1469,6 @@ struct CodeBlockContainer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            
-            // Header Bar
             HStack(spacing: 8) {
                 HStack(spacing: 6) {
                     Circle().fill(Color.red.opacity(0.8)).frame(width: 10, height: 10)
@@ -1399,6 +1480,13 @@ struct CodeBlockContainer: View {
                 Text(language.capitalized.isEmpty ? "Code" : language.capitalized)
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                     .foregroundColor(.gray)
+                
+                if !extractedFileName.isEmpty {
+                    Text(extractedFileName)
+                        .font(.system(size: 12, weight: .regular, design: .monospaced))
+                        .foregroundColor(.gray.opacity(0.7))
+                        .padding(.leading, 4)
+                }
                 
                 Spacer()
                 
@@ -1415,7 +1503,8 @@ struct CodeBlockContainer: View {
                         let panel = NSSavePanel()
                         panel.allowedContentTypes = [.text, .plainText]
                         let ext = language.lowercased() == "bash" ? "sh" : (language.lowercased() == "python" ? "py" : "txt")
-                        panel.nameFieldStringValue = "snippet.\(ext)"
+                        let defaultName = extractedFileName.isEmpty ? "snippet.\(ext)" : extractedFileName
+                        panel.nameFieldStringValue = defaultName
                         if panel.runModal() == .OK, let url = panel.url {
                             try? code.write(to: url, atomically: true, encoding: .utf8)
                             vm.triggerNativeNotification("Snippet saved.")
@@ -1443,11 +1532,9 @@ struct CodeBlockContainer: View {
             .padding(.vertical, 10)
             .background(Color.black.opacity(0.4))
             
-            // Code Area
             if isCodeExpanded {
                 Divider().background(Color.white.opacity(0.1))
                 ScrollView(.horizontal, showsIndicators: true) {
-                    // 🔥 APPLIES THE NEW HIGHLIGHTER
                     Text(colorizeCode(code))
                         .padding(14)
                         .textSelection(.enabled) 
@@ -1467,6 +1554,7 @@ struct CodeBlockContainer: View {
                 self.isHovering = hovering
             }
         }
+        .environment(\.colorScheme, .dark)
     }
 }
 
@@ -1484,7 +1572,6 @@ struct DebugConsoleView: View {
                 
                 Spacer()
                 
-                // Copy Logs Button
                 Button(action: {
                     vm.copyAllLogsToClipboard()
                 }) {
@@ -1497,7 +1584,6 @@ struct DebugConsoleView: View {
                 .buttonStyle(.plain)
                 .padding(.trailing, 8)
 
-                // Clear Button
                 Button(action: {
                     vm.debugLogs.removeAll()
                 }) {
@@ -1521,7 +1607,6 @@ struct DebugConsoleView: View {
                                 .foregroundColor(.gray)
                         } else {
                             ForEach(Array(vm.debugLogs.enumerated()), id: \.offset) { index, log in
-                                // Text color logic: Red if error, otherwise bright green terminal color
                                 Text(log)
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundColor(log.contains("Error") || log.contains("❌") ? .red : .green)
@@ -1533,7 +1618,7 @@ struct DebugConsoleView: View {
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .background(Color.black.opacity(0.9)) // Force deep black background
+                .background(Color.black.opacity(0.9))
                 .cornerRadius(6)
                 .padding(.horizontal, 8)
                 .padding(.bottom, 8)
