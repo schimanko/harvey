@@ -1169,6 +1169,30 @@ struct MessageBubbleView: View {
     @EnvironmentObject var vm: ChatViewModel
     
     var isUser: Bool { message.role == "user" }
+    
+    // 🔥 NEW: Advanced Markdown parser to highlight inline `code`
+    private func styleInlineCode(_ raw: String) -> AttributedString {
+        do {
+            // Parse the raw text into a rich AttributedString
+            var attrString = try AttributedString(
+                markdown: raw,
+                options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
+            )
+            
+            // Scan the text for any parts marked as inline code
+            for run in attrString.runs {
+                if let intent = run.inlinePresentationIntent, intent.contains(.code) {
+                    // Apply the gray highlight and monospaced font
+                    attrString[run.range].backgroundColor = Color.gray.opacity(0.2)
+                    attrString[run.range].font = .system(size: 13, design: .monospaced)
+                    attrString[run.range].foregroundColor = Color.primary
+                }
+            }
+            return attrString
+        } catch {
+            return AttributedString(raw) // Fallback if markdown is malformed
+        }
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -1235,12 +1259,14 @@ struct MessageBubbleView: View {
                                 if block.isCode {
                                     CodeBlockContainer(language: block.language, code: block.text)
                                 } else {
-                                    Text(LocalizedStringKey(block.text))
+                                    // 🔥 UPGRADED: Uses AttributedString to render the highlighted inline code
+                                    Text(styleInlineCode(block.text))
                                         .padding(.horizontal, 14)
                                         .padding(.vertical, 10)
                                         .foregroundColor(.primary)
                                         .background(Color.gray.opacity(0.18))
                                         .cornerRadius(16)
+                                        .textSelection(.enabled) // Allows text highlighting!
                                 }
                             }
                         }
@@ -1251,7 +1277,6 @@ struct MessageBubbleView: View {
                     }
                 }
                 
-                // 🔥 RESTORED: Standard Message Actions (Copy, Save, Regenerate)
                 if !isUser && !message.content.isEmpty && !vm.isGenerating {
                     HStack(spacing: 12) {
                         Button(action: {
