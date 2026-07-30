@@ -2,10 +2,13 @@ import os
 import json
 import re
 import psutil
+import io
+import soundfile as sf
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
@@ -32,6 +35,21 @@ except ImportError:
 # Global pipeline objects initialized once at startup to prevent thermal spikes
 pipeline = {}
 ollama_pid_cache: Optional[int] = None
+kokoro_tts = None
+
+def get_tts():
+    global kokoro_tts
+    if kokoro_tts is None:
+        try:
+            from kokoro_onnx import Kokoro
+            print("🎙️ Loading Kokoro TTS model...")
+            # Use the new v1.0 models
+            kokoro_tts = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+            print("✅ Kokoro TTS loaded successfully.")
+        except Exception as e:
+            print(f"⚠️ Kokoro TTS setup warning: {e}")
+            kokoro_tts = False
+    return kokoro_tts
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -205,6 +223,36 @@ async def get_metrics():
         "harvey_cpu": f"{harvey_cpu:.1f}%"
     }
 
+@app.post("/api/tts")
+async def tts_endpoint(data: dict):
+    """Generates ultra-realistic, low-heat neural speech from text."""
+    text = data.get("text", "").strip()
+    if not text:
+        return Response(status_code=400)
+
+    # Clean out thought tags and markdown before speaking
+    clean_text = re.sub(r'<thought>.*?</thought>', '', text, flags=re.DOTALL)
+    clean_text = re.sub(r'```.*?```', ' I have provided the code. ', clean_text, flags=re.DOTALL)
+    clean_text = re.sub(r'[*#_]', '', clean_text).strip()
+
+    if not clean_text:
+        return Response(status_code=400)
+
+    tts = get_tts()
+    if tts:
+        try:
+            # Generate the audio samples
+            samples, sample_rate = tts.create(clean_text, voice="am_adam", speed=1.0, lang="en-us")
+            buffer = io.BytesIO()
+            sf.write(buffer, samples, sample_rate, format='WAV')
+            return Response(content=buffer.getvalue(), media_type="audio/wav")
+        except Exception as e:
+            print(f"❌ TTS Generation Error: {e}")
+            return Response(status_code=500)
+    else:
+        print("❌ TTS failed because Kokoro is not initialized.")
+        return Response(status_code=500)
+    
 @app.post("/api/chat")
 async def chat_endpoint(req: ChatRequest):
     full_prompt = req.question
