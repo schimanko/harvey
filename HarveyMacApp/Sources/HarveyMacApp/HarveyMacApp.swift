@@ -569,8 +569,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
+        // 🔥 FIX 1: Ruthlessly strict prompt
         let body: [String: Any] = [
-            "question": "Provide a 2 to 4 word title for this prompt. Output ONLY the title, no quotes, no markdown, no other text: \(prompt)",
+            "question": "Summarize this request in exactly 2 to 4 words. Use Title Case. NO punctuation, NO quotes, NO conversational text. Output ONLY the short title. Request: \(prompt)",
             "chat_history": ""
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -591,15 +592,16 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 }
             }
             
-            // 🔥 FIXED: (?is) enables dot-matches-all so multi-line <thought> blocks are completely stripped
             var cleanTitle = accumulated
                 .replacingOccurrences(of: "(?is)<(thought|summary|think)>.*?</\\1>", with: "", options: .regularExpression)
                 .replacingOccurrences(of: "\"", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             
-            // Fallback safety if the model only output a thought
+            // 🔥 FIX 2: Hard fallback and strict truncation (Max 35 characters)
             if cleanTitle.hasPrefix("<") || cleanTitle.isEmpty {
-                cleanTitle = String(prompt.prefix(22)) + (prompt.count > 22 ? "..." : "")
+                cleanTitle = String(prompt.prefix(25)) + "..."
+            } else if cleanTitle.count > 35 {
+                cleanTitle = String(cleanTitle.prefix(32)) + "..."
             }
             
             let finalTitle = cleanTitle
@@ -1338,20 +1340,55 @@ struct MessageBubbleView: View {
     }
 }
 
-// 🔥 UPGRADED: Code Block Container (Mac Window Style)
+// 🔥 UPGRADED: Code Block Container with Native Syntax Highlighting
 struct CodeBlockContainer: View {
     let language: String
     let code: String
     @State private var isCodeExpanded: Bool = true
     @State private var isHovering: Bool = false
     @EnvironmentObject var vm: ChatViewModel
+    
+    // 🎨 Native Regex Syntax Highlighter
+    private func colorizeCode(_ code: String) -> AttributedString {
+        var attr = AttributedString(code)
+        attr.font = .system(size: 13, design: .monospaced)
+        attr.foregroundColor = Color(red: 0.85, green: 0.85, blue: 0.9) // Default text
+        
+        let nsString = code as NSString
+        
+        // IDE Colors
+        let keywordColor = Color(red: 0.98, green: 0.45, blue: 0.65) // Pink
+        let stringColor = Color(red: 0.95, green: 0.78, blue: 0.45)  // Yellow
+        let commentColor = Color(red: 0.45, green: 0.75, blue: 0.45) // Green
+        let numberColor = Color(red: 0.55, green: 0.75, blue: 0.95)  // Light Blue
+        
+        // Common language patterns (Supports Swift, Python, JS, C++)
+        let patterns: [(String, Color)] = [
+            ("//.*|#.*", commentColor), // Comments
+            ("\".*?\"|'.*?'", stringColor), // Strings
+            ("\\b\\d+(\\.\\d+)?\\b", numberColor), // Numbers
+            ("\\b(import|func|def|class|struct|let|var|if|else|return|guard|for|in|while|switch|case|default|self|true|false|nil|None|async|await|try|catch|print)\\b", keywordColor) // Keywords
+        ]
+        
+        for (pattern, color) in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                let matches = regex.matches(in: code, options: [], range: NSRange(location: 0, length: nsString.length))
+                for match in matches {
+                    if let stringRange = Range(match.range, in: code),
+                       let attrRange = Range<AttributedString.Index>(stringRange, in: attr) {
+                        attr[attrRange].foregroundColor = color
+                    }
+                }
+            }
+        }
+        return attr
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             
             // Header Bar
             HStack(spacing: 8) {
-                // Mac OS Traffic Lights
                 HStack(spacing: 6) {
                     Circle().fill(Color.red.opacity(0.8)).frame(width: 10, height: 10)
                     Circle().fill(Color.yellow.opacity(0.8)).frame(width: 10, height: 10)
@@ -1365,7 +1402,6 @@ struct CodeBlockContainer: View {
                 
                 Spacer()
                 
-                // RESTORED: Code Actions
                 HStack(spacing: 12) {
                     Button(action: {
                         withAnimation(.spring()) { isCodeExpanded.toggle() }
@@ -1411,15 +1447,14 @@ struct CodeBlockContainer: View {
             if isCodeExpanded {
                 Divider().background(Color.white.opacity(0.1))
                 ScrollView(.horizontal, showsIndicators: true) {
-                    Text(code)
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundColor(Color(red: 0.85, green: 0.85, blue: 0.9)) // Soft white/blue tint
+                    // 🔥 APPLIES THE NEW HIGHLIGHTER
+                    Text(colorizeCode(code))
                         .padding(14)
-                        .textSelection(.enabled) // Allows you to highlight specific lines
+                        .textSelection(.enabled) 
                 }
             }
         }
-        .background(Color(red: 0.12, green: 0.12, blue: 0.14)) // Sleek dark gray
+        .background(Color(red: 0.12, green: 0.12, blue: 0.14))
         .cornerRadius(12)
         .overlay(
             RoundedRectangle(cornerRadius: 12)
