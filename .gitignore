@@ -37,6 +37,9 @@ DerivedData/
 *.swp
 
 # Extension Build Artifacts & Dependencies
-harvey-extension/node_modules/
+≈/node_modules/
 harvey-extension/dist/
 harvey-extension/out/
+
+# Extension Folder
+harvey-extension/
