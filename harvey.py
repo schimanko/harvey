@@ -1,4 +1,5 @@
 # harvey.py
+import mlx.core as mx
 import os
 import warnings
 import json
@@ -443,6 +444,8 @@ async def chat_endpoint(req: ChatRequest):
                 saved_files = extract_and_save_files(full_response)
                 for file in saved_files:
                     yield f"data: {json.dumps({'toast': f'Auto-saved copy to Desktop: {file}'})}\n\n"
+                    # 🔥 NEW: Instantly return gigabytes of VRAM to macOS
+                mx.metal.clear_cache()
 
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"

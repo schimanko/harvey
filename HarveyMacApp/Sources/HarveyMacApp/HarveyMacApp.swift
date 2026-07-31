@@ -4,6 +4,13 @@ import Foundation
 import UniformTypeIdentifiers
 import UserNotifications
 import AVFoundation
+import Charts
+
+struct MetricPoint: Identifiable {
+    let id = UUID()
+    let time = Date()
+    let value: Double
+}
 
 // MARK: - Data Models
 struct AttachedFileItem: Identifiable, Codable {
@@ -114,7 +121,10 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var searchText: String = ""
     @Published var showCodeSidebar: Bool = false
     @Published var sessions: [ChatSession] = []
-    @Published var activeSessionId: UUID?
+    
+    // 🔥 NEW: Set-based selection for multi-select
+    @Published var selectedSessionIds: Set<UUID> = []
+    
     @Published var inputMessage: String = ""
     @Published var isGenerating: Bool = false
     
@@ -122,6 +132,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var isMetricsMode: Bool = false
     @Published var debugLogs: [String] = []
     @Published var metrics: HardwareMetricsData = HardwareMetricsData()
+    // 🔥 NEW: Store the last 60 seconds of data
+    @Published var cpuHistory: [MetricPoint] = []
+    @Published var ramHistory: [MetricPoint] = []
     @Published var scrollTrigger: UUID = UUID()
     @Published var attachedFiles: [AttachedFileItem] = []
     
@@ -150,13 +163,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         ServerManager.shared.viewModel = self
         requestNotificationPermission()
         loadSessionsFromDisk()
-        startMetricsPolling()
-        
-        // Wire up STT logic
+                
         speechManager.onTranscriptionUpdated = { [weak self] text in
-            Task { @MainActor in
-                self?.liveTranscription = text
-            }
+            Task { @MainActor in self?.liveTranscription = text }
         }
         
         speechManager.onSilenceDetected = { [weak self] text in
@@ -171,7 +180,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
     
-    // MARK: - Call Mechanics
     func startCall() {
         isCallMode = true
         startListening()
@@ -219,19 +227,16 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                         self.audioPlayer?.delegate = self
                         self.audioPlayer?.play()
                     } catch {
-                        self.logDebug("Audio Decode Error: \(error.localizedDescription)")
                         self.audioPlayerDidFinishPlaying(self.audioPlayer ?? AVAudioPlayer(), successfully: false)
                     }
                 }
             } else {
                 await MainActor.run {
-                    self.logDebug("TTS API Failed: HTTP \(statusCode)")
                     self.audioPlayerDidFinishPlaying(AVAudioPlayer(), successfully: false)
                 }
             }
         } catch {
             await MainActor.run {
-                self.logDebug("TTS Network Error: \(error.localizedDescription)")
                 self.audioPlayerDidFinishPlaying(AVAudioPlayer(), successfully: false)
             }
         }
@@ -246,15 +251,18 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
     
-    // MARK: - Standard Logic
     private func requestNotificationPermission() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
     
     var activeSession: ChatSession? {
-        get { sessions.first(where: { $0.id == activeSessionId }) }
+        get {
+            guard selectedSessionIds.count == 1, let id = selectedSessionIds.first else { return nil }
+            return sessions.first(where: { $0.id == id })
+        }
         set {
-            if let index = sessions.firstIndex(where: { $0.id == activeSessionId }), let newValue = newValue {
+            guard selectedSessionIds.count == 1, let id = selectedSessionIds.first else { return }
+            if let index = sessions.firstIndex(where: { $0.id == id }), let newValue = newValue {
                 sessions[index] = newValue
                 saveSessionsToDisk()
             }
@@ -274,9 +282,8 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let decoded = try JSONDecoder().decode([ChatSession].self, from: data)
             if !decoded.isEmpty {
                 self.sessions = decoded
-                
                 if let lastSession = self.sessions.last, lastSession.messages.isEmpty {
-                    self.activeSessionId = lastSession.id
+                    self.selectedSessionIds = [lastSession.id]
                 } else {
                     createNewSession()
                 }
@@ -289,16 +296,32 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     func createNewSession() {
         let newSession = ChatSession(title: "New Chat \(sessions.count + 1)")
         sessions.append(newSession)
-        activeSessionId = newSession.id
+        selectedSessionIds = [newSession.id]
         saveSessionsToDisk()
     }
     
     func deleteSession(id: UUID) {
         sessions.removeAll(where: { $0.id == id })
-        if activeSessionId == id {
-            activeSessionId = sessions.first?.id
+        selectedSessionIds.remove(id)
+        if selectedSessionIds.isEmpty {
+            if let first = sessions.first {
+                selectedSessionIds = [first.id]
+            } else {
+                createNewSession()
+            }
         }
-        if sessions.isEmpty { createNewSession() }
+        saveSessionsToDisk()
+    }
+
+    // 🔥 NEW: Batch Delete Handler
+    func deleteSelectedSessions() {
+        sessions.removeAll { selectedSessionIds.contains($0.id) }
+        selectedSessionIds.removeAll()
+        if let first = sessions.first {
+            selectedSessionIds = [first.id]
+        } else {
+            createNewSession()
+        }
         saveSessionsToDisk()
     }
 
@@ -359,13 +382,23 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         UNUserNotificationCenter.current().add(request) { _ in }
     }
     
-      func startMetricsPolling() {
-        // Changed to 10.0 seconds to allow the Mac's efficiency cores to sleep
-        metricsTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self, self.isMetricsMode else { return }
-                await self.fetchMetrics()
+    // 🔥 NEW: Hard kill/start the timer to save Mac battery
+    func toggleMetricsMode() {
+        isMetricsMode.toggle()
+        
+        if isMetricsMode {
+            // Start polling every 1 second
+            metricsTimer?.invalidate()
+            metricsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                Task { @MainActor in await self?.fetchMetrics() }
             }
+            Task { await fetchMetrics() } // Initial fetch
+        } else {
+            // Kill the timer completely and wipe memory arrays
+            metricsTimer?.invalidate()
+            metricsTimer = nil
+            cpuHistory.removeAll()
+            ramHistory.removeAll()
         }
     }
     
@@ -375,12 +408,23 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let (data, _) = try await URLSession.shared.data(from: url)
             if let decoded = try? JSONDecoder().decode(HardwareMetricsData.self, from: data) {
                 self.metrics = decoded
+                
+                // Parse strings like "12.5%" into pure Doubles for the graph
+                let cpuStr = decoded.sys_cpu.replacingOccurrences(of: "%", with: "")
+                let ramStr = decoded.sys_ram_gb.replacingOccurrences(of: " GB", with: "")
+                
+                self.cpuHistory.append(MetricPoint(value: Double(cpuStr) ?? 0))
+                self.ramHistory.append(MetricPoint(value: Double(ramStr) ?? 0))
+                
+                // Keep only the last 60 seconds (60 points) to prevent memory bloat
+                if self.cpuHistory.count > 60 { self.cpuHistory.removeFirst() }
+                if self.ramHistory.count > 60 { self.ramHistory.removeFirst() }
             }
         } catch { }
     }
 
     func sendMessage(overridePrompt: String? = nil) {
-        guard let sessionIndex = sessions.firstIndex(where: { $0.id == activeSessionId }) else { return }
+        guard let id = selectedSessionIds.first, let sessionIndex = sessions.firstIndex(where: { $0.id == id }) else { return }
         
         let userText = overridePrompt ?? inputMessage.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         if userText.isEmpty && attachedFiles.isEmpty && liveTranscription.isEmpty { return }
@@ -422,7 +466,8 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     
     func regenerateResponse(for messageId: UUID) {
         guard !isGenerating,
-              let sessionIndex = sessions.firstIndex(where: { $0.id == activeSessionId }),
+              let id = selectedSessionIds.first,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == id }),
               let msgIndex = sessions[sessionIndex].messages.firstIndex(where: { $0.id == messageId }),
               msgIndex > 0 else { return }
         
@@ -432,7 +477,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
     
     private func streamResponse(sessionIndex: Int, messageIndex: Int, prompt: String, files: [AttachedFileItem]) async {
-        // Always clear spinner and save when we exit this function
         defer {
             Task { @MainActor in
                 self.isGenerating = false
@@ -442,7 +486,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
 
         guard let url = URL(string: "http://127.0.0.1:8000/api/chat") else {
-            sessions[sessionIndex].messages[messageIndex].content = "Connection failed. Invalid chat URL."
+            sessions[sessionIndex].messages[messageIndex].content = "Connection failed."
             return
         }
 
@@ -495,11 +539,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
                             let now = Date()
                             if now.timeIntervalSince(lastRenderTime) > 0.15 {
-                                parseThoughtAndContent(
-                                    raw: rawAccumulated,
-                                    sessionIndex: sessionIndex,
-                                    messageIndex: messageIndex
-                                )
+                                parseThoughtAndContent(raw: rawAccumulated, sessionIndex: sessionIndex, messageIndex: messageIndex)
                                 scrollTrigger = UUID()
                                 lastRenderTime = now
                             }
@@ -508,13 +548,8 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 }
             }
 
-            // Final parse after streaming ends
             if !rawAccumulated.isEmpty {
-                parseThoughtAndContent(
-                    raw: rawAccumulated,
-                    sessionIndex: sessionIndex,
-                    messageIndex: messageIndex
-                )
+                parseThoughtAndContent(raw: rawAccumulated, sessionIndex: sessionIndex, messageIndex: messageIndex)
                 scrollTrigger = UUID()
             }
 
@@ -564,7 +599,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    // MARK: - Utilities (Search, Pin, Auto-Name, Export, Parser)
     func parseBlocks(raw: String) -> [ContentBlock] {
         var blocks: [ContentBlock] = []
         let components = raw.components(separatedBy: "```")
@@ -604,7 +638,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
     
     func generateTitle(for sessionId: UUID, prompt: String) async {
-        guard let url = URL(string: "http://127.0.0.1:8000/api/chat") else { return }
+        guard let url = URL(string: "[http://127.0.0.1:8000/api/chat](http://127.0.0.1:8000/api/chat)") else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -805,7 +839,6 @@ struct CallModeOverlay: View {
     }
 }
 
-// Helper for Background Blur
 struct VisualEffectView: NSViewRepresentable {
     var material: NSVisualEffectView.Material
     var blendingMode: NSVisualEffectView.BlendingMode
@@ -888,7 +921,6 @@ struct CodeSidebarView: View {
                 result.append(ExtractedCode(language: block.language, code: block.text, date: msg.timestamp))
             }
         }
-        // Sort newest first
         return result.sorted { $0.date > $1.date }
     }
     
@@ -963,7 +995,8 @@ struct MainView: View {
                 }
                 .padding([.horizontal, .top])
 
-                List(selection: $vm.activeSessionId) {
+                // 🔥 NEW: Set Selection enabled
+                List(selection: $vm.selectedSessionIds) {
                     ForEach(vm.filteredSessions) { session in
                         SidebarItemView(
                             session: session,
@@ -997,201 +1030,253 @@ struct MainView: View {
             }
             .frame(minWidth: 180, idealWidth: 200)
         } detail: {
-            ZStack(alignment: .top) {
-                HStack(spacing: 0) {
-                    VStack(spacing: 0) {
-                        HStack(spacing: 8) {
-                            Text(vm.activeSession?.title ?? "Chat")
-                                .font(.subheadline)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.primary)
-                            
-                            Button(action: { 
-                                vm.isMetricsMode.toggle()
-                                if vm.isMetricsMode { Task { await vm.fetchMetrics() } }
-                            }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "cpu")
-                                    Text("Metrics")
-                                }
-                                .font(.caption)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(vm.isMetricsMode ? Color.blue.opacity(0.2) : Color.gray.opacity(0.15))
-                                .foregroundColor(vm.isMetricsMode ? .blue : .primary)
-                                .cornerRadius(6)
-                            }
-                            .buttonStyle(.plain)
-                            .padding(.leading, 8)
-                            
-                            Button(action: { vm.isDebugMode.toggle() }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "ladybug")
-                                    Text("Debugging")
-                                }
-                                .font(.caption)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(vm.isDebugMode ? Color.orange.opacity(0.2) : Color.gray.opacity(0.15))
-                                .foregroundColor(vm.isDebugMode ? .orange : .primary)
-                                .cornerRadius(6)
-                            }
-                            .buttonStyle(.plain)
-                            
-                            Spacer()
-                            
-                            Button(action: {
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                    vm.showCodeSidebar.toggle()
-                                }
-                            }) {
-                                Image(systemName: "sidebar.right")
-                                    .font(.system(size: 14, weight: .medium))
-                                    .foregroundColor(vm.showCodeSidebar ? .accentColor : .primary)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(vm.showCodeSidebar ? Color.accentColor.opacity(0.15) : Color.gray.opacity(0.15))
-                                    .cornerRadius(6)
-                            }
-                            .buttonStyle(.plain)
-                            
-                            Menu {
-                                Button(vm.activeSession?.isPinned == true ? "Unpin Chat" : "Pin Chat") {
-                                    if let id = vm.activeSessionId { vm.togglePin(for: id) }
-                                }
-                                Button("Rename Chat") {
-                                    if let session = vm.activeSession {
-                                        renameTitle = session.title
-                                        sessionToRename = session.id
-                                        showRenameAlert = true
-                                    }
-                                }
-                                Menu("Download as...") {
-                                    Button("Markdown (.md)") {
-                                        if let session = vm.activeSession { vm.exportToMarkdown(session: session) }
-                                    }
-                                    Button("PDF (.pdf)") {
-                                        if let session = vm.activeSession { vm.exportToPDF(session: session) }
-                                    }
-                                }
-                                Divider()
-                                Button("Delete Chat", role: .destructive) {
-                                    if let id = vm.activeSessionId { vm.deleteSession(id: id) }
-                                }
-                            } label: {
-                                Image(systemName: "ellipsis")
-                                    .font(.system(size: 14, weight: .medium))
+            // 🔥 NEW: Multi-Select Deletion View vs Standard Chat View
+            if vm.selectedSessionIds.count > 1 {
+                VStack(spacing: 20) {
+                    Image(systemName: "trash.circle.fill")
+                        .font(.system(size: 70))
+                        .foregroundColor(.red.opacity(0.8))
+                    
+                    Text("\(vm.selectedSessionIds.count) Chats Selected")
+                        .font(.title)
+                        .fontWeight(.bold)
+                    
+                    Button(action: {
+                        withAnimation {
+                            vm.deleteSelectedSessions()
+                        }
+                    }) {
+                        Text("Delete Selected Chats")
+                            .font(.headline)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(Color.red)
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(NSColor.windowBackgroundColor))
+            } else {
+                ZStack(alignment: .top) {
+                    HStack(spacing: 0) {
+                        VStack(spacing: 0) {
+                            HStack(spacing: 8) {
+                                Text(vm.activeSession?.title ?? "Chat")
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
                                     .foregroundColor(.primary)
+                                
+                                Button(action: { 
+                                    vm.toggleMetricsMode()
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "cpu")
+                                        Text("Metrics")
+                                    }
+                                    .font(.caption)
                                     .padding(.horizontal, 8)
                                     .padding(.vertical, 4)
-                                    .background(Color.gray.opacity(0.15))
+                                    .background(vm.isMetricsMode ? Color.blue.opacity(0.2) : Color.gray.opacity(0.15))
+                                    .foregroundColor(vm.isMetricsMode ? .blue : .primary)
                                     .cornerRadius(6)
-                            }
-                            .menuStyle(.borderlessButton)
-                            .menuIndicator(.hidden)
-                            .frame(width: 32)
-                        }
-                        .padding()
-                        .background(Color(NSColor.controlBackgroundColor))
-
-                        Divider()
-
-                        if vm.isMetricsMode {
-                            HardwareMetricsView()
-                            Divider()
-                        }
-
-                        ScrollViewReader { proxy in
-                            ScrollView {
-                                LazyVStack(spacing: 16) {
-                                    if let messages = vm.activeSession?.messages {
-                                        ForEach(messages) { msg in
-                                            MessageBubbleView(message: msg) {
-                                                vm.regenerateResponse(for: msg.id)
-                                            }
-                                            .id(msg.id)
-                                        }
-                                    }
-                                    Color.clear.frame(height: 1).id("bottomAnchor")
-                                }
-                                .padding()
-                            }
-                            .onChange(of: vm.scrollTrigger) { _, _ in
-                                withAnimation(.easeOut(duration: 0.1)) {
-                                    proxy.scrollTo("bottomAnchor", anchor: .bottom)
-                                }
-                            }
-                        }
-
-                        Divider()
-
-                        if vm.isDebugMode {
-                            DebugConsoleView()
-                                .frame(height: 140)
-                            Divider()
-                        }
-
-                        VStack(spacing: 6) {
-                            if !vm.attachedFiles.isEmpty {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 8) {
-                                        ForEach(vm.attachedFiles) { file in
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "doc.fill")
-                                                    .foregroundColor(.accentColor)
-                                                Text(file.name)
-                                                    .font(.caption)
-                                                    .fontWeight(.medium)
-                                                Button(action: { vm.removeAttachedFile(id: file.id) }) {
-                                                    Image(systemName: "xmark.circle.fill")
-                                                        .foregroundColor(.gray)
-                                                }
-                                                .buttonStyle(.plain)
-                                            }
-                                            .padding(.horizontal, 8)
-                                            .padding(.vertical, 4)
-                                            .background(Color.accentColor.opacity(0.15))
-                                            .cornerRadius(8)
-                                        }
-                                    }
-                                }
-                                .padding(.bottom, 4)
-                            }
-
-                            HStack(spacing: 10) {
-                                Button(action: { vm.selectFilesForAnalysis() }) {
-                                    Image(systemName: "paperclip")
-                                        .font(.system(size: 18))
-                                        .foregroundColor(.secondary)
                                 }
                                 .buttonStyle(.plain)
-
+                                .padding(.leading, 8)
+                                
+                                Button(action: { vm.isDebugMode.toggle() }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "ladybug")
+                                        Text("Debugging")
+                                    }
+                                    .font(.caption)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(vm.isDebugMode ? Color.orange.opacity(0.2) : Color.gray.opacity(0.15))
+                                    .foregroundColor(vm.isDebugMode ? .orange : .primary)
+                                    .cornerRadius(6)
+                                }
+                                .buttonStyle(.plain)
+                                
+                                Spacer()
+                                
                                 Button(action: {
-                                    if vm.isListening {
-                                        vm.speechManager.stopListening()
-                                        vm.isListening = false
-                                        if !vm.liveTranscription.isEmpty {
-                                            vm.inputMessage = vm.liveTranscription
-                                            vm.liveTranscription = ""
-                                            vm.sendMessage()
-                                        }
-                                    } else {
-                                        vm.startListening()
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                        vm.showCodeSidebar.toggle()
                                     }
                                 }) {
-                                    Image(systemName: vm.isListening && !vm.isCallMode ? "mic.fill" : "mic")
-                                        .font(.system(size: 18))
-                                        .foregroundColor(vm.isListening && !vm.isCallMode ? .red : .secondary)
+                                    Image(systemName: "sidebar.right")
+                                        .font(.system(size: 14, weight: .medium))
+                                        .foregroundColor(vm.showCodeSidebar ? .accentColor : .primary)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(vm.showCodeSidebar ? Color.accentColor.opacity(0.15) : Color.gray.opacity(0.15))
+                                        .cornerRadius(6)
                                 }
                                 .buttonStyle(.plain)
+                                
+                                Menu {
+                                    Button(vm.activeSession?.isPinned == true ? "Unpin Chat" : "Pin Chat") {
+                                        if let id = vm.selectedSessionIds.first { vm.togglePin(for: id) }
+                                    }
+                                    Button("Rename Chat") {
+                                        if let session = vm.activeSession {
+                                            renameTitle = session.title
+                                            sessionToRename = session.id
+                                            showRenameAlert = true
+                                        }
+                                    }
+                                    Menu("Download as...") {
+                                        Button("Markdown (.md)") {
+                                            if let session = vm.activeSession { vm.exportToMarkdown(session: session) }
+                                        }
+                                        Button("PDF (.pdf)") {
+                                            if let session = vm.activeSession { vm.exportToPDF(session: session) }
+                                        }
+                                    }
+                                    Divider()
+                                    Button("Delete Chat", role: .destructive) {
+                                        if let id = vm.selectedSessionIds.first { vm.deleteSession(id: id) }
+                                    }
+                                } label: {
+                                    Image(systemName: "ellipsis")
+                                        .font(.system(size: 14, weight: .medium))
+                                        .foregroundColor(.primary)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.gray.opacity(0.15))
+                                        .cornerRadius(6)
+                                }
+                                .menuStyle(.borderlessButton)
+                                .menuIndicator(.hidden)
+                                .frame(width: 32)
+                            }
+                            .padding()
+                            .background(Color(NSColor.controlBackgroundColor))
 
-                                TextField("Ask Harvey anything...", text: vm.isListening ? $vm.liveTranscription : $vm.inputMessage, axis: .vertical)
-                                    .textFieldStyle(.plain)
-                                    .padding(10)
-                                    .background(Color.gray.opacity(0.12))
-                                    .cornerRadius(10)
-                                    .lineLimit(1...5)
-                                    .onSubmit { 
+                            Divider()
+
+                            if vm.isMetricsMode {
+                                HardwareMetricsView()
+                                Divider()
+                            }
+
+                            ScrollViewReader { proxy in
+                                ScrollView {
+                                    LazyVStack(spacing: 16) {
+                                        if let messages = vm.activeSession?.messages {
+                                            ForEach(messages) { msg in
+                                                MessageBubbleView(message: msg) {
+                                                    vm.regenerateResponse(for: msg.id)
+                                                }
+                                                .id(msg.id)
+                                            }
+                                        }
+                                        Color.clear.frame(height: 1).id("bottomAnchor")
+                                    }
+                                    .padding()
+                                }
+                                .onChange(of: vm.scrollTrigger) { _, _ in
+                                    withAnimation(.easeOut(duration: 0.1)) {
+                                        proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                                    }
+                                }
+                            }
+
+                            Divider()
+
+                            if vm.isDebugMode {
+                                DebugConsoleView()
+                                    .frame(height: 140)
+                                Divider()
+                            }
+
+                            VStack(spacing: 6) {
+                                if !vm.attachedFiles.isEmpty {
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        HStack(spacing: 8) {
+                                            ForEach(vm.attachedFiles) { file in
+                                                HStack(spacing: 4) {
+                                                    Image(systemName: "doc.fill")
+                                                        .foregroundColor(.accentColor)
+                                                    Text(file.name)
+                                                        .font(.caption)
+                                                        .fontWeight(.medium)
+                                                    Button(action: { vm.removeAttachedFile(id: file.id) }) {
+                                                        Image(systemName: "xmark.circle.fill")
+                                                            .foregroundColor(.gray)
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                }
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 4)
+                                                .background(Color.accentColor.opacity(0.15))
+                                                .cornerRadius(8)
+                                            }
+                                        }
+                                    }
+                                    .padding(.bottom, 4)
+                                }
+
+                                HStack(spacing: 10) {
+                                    Button(action: { vm.selectFilesForAnalysis() }) {
+                                        Image(systemName: "paperclip")
+                                            .font(.system(size: 18))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Button(action: {
+                                        if vm.isListening {
+                                            vm.speechManager.stopListening()
+                                            vm.isListening = false
+                                            if !vm.liveTranscription.isEmpty {
+                                                vm.inputMessage = vm.liveTranscription
+                                                vm.liveTranscription = ""
+                                                vm.sendMessage()
+                                            }
+                                        } else {
+                                            vm.startListening()
+                                        }
+                                    }) {
+                                        Image(systemName: vm.isListening && !vm.isCallMode ? "mic.fill" : "mic")
+                                            .font(.system(size: 18))
+                                            .foregroundColor(vm.isListening && !vm.isCallMode ? .red : .secondary)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    TextField("Ask Harvey anything...", text: vm.isListening ? $vm.liveTranscription : $vm.inputMessage, axis: .vertical)
+                                        .textFieldStyle(.plain)
+                                        .padding(10)
+                                        .background(Color.gray.opacity(0.12))
+                                        .cornerRadius(10)
+                                        .lineLimit(1...5)
+                                        .onSubmit { 
+                                            if vm.isListening {
+                                                vm.speechManager.stopListening()
+                                                vm.isListening = false
+                                                vm.inputMessage = vm.liveTranscription
+                                                vm.liveTranscription = ""
+                                            }
+                                            vm.sendMessage() 
+                                        }
+
+                                    Button(action: { 
+                                        if vm.isCallMode {
+                                            vm.endCall()
+                                        } else {
+                                            vm.startCall()
+                                        }
+                                    }) {
+                                        Image(systemName: "phone.circle.fill")
+                                            .font(.system(size: 24))
+                                            .foregroundColor(.green)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Call Harvey")
+
+                                    Button(action: { 
                                         if vm.isListening {
                                             vm.speechManager.stopListening()
                                             vm.isListening = false
@@ -1199,47 +1284,24 @@ struct MainView: View {
                                             vm.liveTranscription = ""
                                         }
                                         vm.sendMessage() 
+                                    }) {
+                                        Image(systemName: "arrow.up.circle.fill")
+                                            .font(.system(size: 24))
+                                            .foregroundColor((vm.inputMessage.isEmpty && vm.attachedFiles.isEmpty && vm.liveTranscription.isEmpty) ? .gray : .accentColor)
                                     }
-
-                                Button(action: { 
-                                    if vm.isCallMode {
-                                        vm.endCall()
-                                    } else {
-                                        vm.startCall()
-                                    }
-                                }) {
-                                    Image(systemName: "phone.circle.fill")
-                                        .font(.system(size: 24))
-                                        .foregroundColor(.green)
+                                    .buttonStyle(.plain)
+                                    .disabled(((vm.inputMessage.isEmpty && vm.liveTranscription.isEmpty) && vm.attachedFiles.isEmpty) || vm.isGenerating)
                                 }
-                                .buttonStyle(.plain)
-                                .help("Call Harvey")
-
-                                Button(action: { 
-                                    if vm.isListening {
-                                        vm.speechManager.stopListening()
-                                        vm.isListening = false
-                                        vm.inputMessage = vm.liveTranscription
-                                        vm.liveTranscription = ""
-                                    }
-                                    vm.sendMessage() 
-                                }) {
-                                    Image(systemName: "arrow.up.circle.fill")
-                                        .font(.system(size: 24))
-                                        .foregroundColor((vm.inputMessage.isEmpty && vm.attachedFiles.isEmpty && vm.liveTranscription.isEmpty) ? .gray : .accentColor)
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(((vm.inputMessage.isEmpty && vm.liveTranscription.isEmpty) && vm.attachedFiles.isEmpty) || vm.isGenerating)
                             }
+                            .padding()
+                            .background(Color(NSColor.windowBackgroundColor))
                         }
-                        .padding()
-                        .background(Color(NSColor.windowBackgroundColor))
-                    }
-                    
-                    if vm.showCodeSidebar {
-                        Divider()
-                        CodeSidebarView()
-                            .transition(.move(edge: .trailing))
+                        
+                        if vm.showCodeSidebar {
+                            Divider()
+                            CodeSidebarView()
+                                .transition(.move(edge: .trailing))
+                        }
                     }
                 }
             }
@@ -1254,17 +1316,72 @@ struct HardwareMetricsView: View {
 
     var body: some View {
         HStack(spacing: 20) {
-            MetricBadge(label: "Mac RAM", value: "\(vm.metrics.sys_ram_pct) (\(vm.metrics.sys_ram_gb))")
-            MetricBadge(label: "Mac CPU", value: vm.metrics.sys_cpu)
-            MetricBadge(label: "Thermal State", value: vm.metrics.thermal)
-            Divider().frame(height: 24)
-            MetricBadge(label: "Harvey RAM", value: vm.metrics.harvey_ram_gb)
-            MetricBadge(label: "Harvey CPU", value: vm.metrics.harvey_cpu)
+            // LEFT SIDE: Badges
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 20) {
+                    MetricBadge(label: "Mac RAM", value: "\(vm.metrics.sys_ram_pct) (\(vm.metrics.sys_ram_gb))")
+                    MetricBadge(label: "Mac CPU", value: vm.metrics.sys_cpu)
+                    MetricBadge(label: "Thermal", value: vm.metrics.thermal)
+                }
+                HStack(spacing: 20) {
+                    MetricBadge(label: "Harvey RAM", value: vm.metrics.harvey_ram_gb)
+                    MetricBadge(label: "Harvey CPU", value: vm.metrics.harvey_cpu)
+                }
+            }
+            .frame(width: 280)
+            
+            Divider().frame(height: 70)
+            
+            // RIGHT SIDE: Live Graphs
+            HStack(spacing: 20) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("CPU History").font(.system(size: 10, weight: .semibold, design: .monospaced)).foregroundColor(.secondary)
+                    Chart(vm.cpuHistory) { point in
+                        LineMark(
+                            x: .value("Time", point.time),
+                            y: .value("CPU", point.value)
+                        )
+                        .foregroundStyle(Color.blue.gradient)
+                        .interpolationMethod(.catmullRom) // Smooth curves
+                        
+                        AreaMark(
+                            x: .value("Time", point.time),
+                            y: .value("CPU", point.value)
+                        )
+                        .foregroundStyle(LinearGradient(colors: [Color.blue.opacity(0.3), .clear], startPoint: .top, endPoint: .bottom))
+                        .interpolationMethod(.catmullRom)
+                    }
+                    .chartYScale(domain: 0...100)
+                    .chartXAxis(.hidden)
+                }
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("RAM History (GB)").font(.system(size: 10, weight: .semibold, design: .monospaced)).foregroundColor(.secondary)
+                    Chart(vm.ramHistory) { point in
+                        LineMark(
+                            x: .value("Time", point.time),
+                            y: .value("RAM", point.value)
+                        )
+                        .foregroundStyle(Color.purple.gradient)
+                        .interpolationMethod(.catmullRom)
+                        
+                        AreaMark(
+                            x: .value("Time", point.time),
+                            y: .value("RAM", point.value)
+                        )
+                        .foregroundStyle(LinearGradient(colors: [Color.purple.opacity(0.3), .clear], startPoint: .top, endPoint: .bottom))
+                        .interpolationMethod(.catmullRom)
+                    }
+                    .chartYScale(domain: 0...24) // Assuming Mac is ~16GB-24GB max
+                    .chartXAxis(.hidden)
+                }
+            }
+            .frame(height: 70)
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, 12)
         .padding(.horizontal, 16)
-        .frame(maxWidth: .infinity)
-        .background(Color.blue.opacity(0.06))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.blue.opacity(0.04))
     }
 }
 
