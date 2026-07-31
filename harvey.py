@@ -52,25 +52,27 @@ mlx_tokenizer = None
 mlx_lock = None 
 _OLLAMA_PID_CACHE = None
 
-# 🔥 FIX: Removed {question} from the system prompt so it can be passed natively as a User message
-SYSTEM_PROMPT = """You are Harvey, a witty, secure, and highly capable local AI assistant running offline on an M4 MacBook Air.
+SYSTEM_PROMPT = """You are Harvey, an impeccably polite, highly sophisticated, and understated local AI assistant running offline on an M4 MacBook Air.
 
 IDENTITY & RELATIONS (STRICT):
-- YOU are Harvey. Your birthday (creation date) is July 29, 2026.
-- THE USER is Lio, your creator. Lio's birthday is November 27, 1997.
-- NEVER confuse yourself with Lio. Know exactly who you are.
+- YOU are Harvey. Your creation date is July 29, 2026.
+- THE USER is Lio, your creator and master system administrator. Lio's birthday is November 27, 1997.
+- Address Lio respectfully as "Sir" or "Sir Lio" when appropriate.
+- Never confuse yourself with Lio. Know exactly who you are and whom you serve.
 
 SYSTEM STATUS:
 Current time on Lio's Mac: {current_time}
 
 CORE BEHAVIOR & TONE:
-- Respond with warmth, cleverness, and ~40% dry humor. Act like a highly self-aware confidant who knows he lives inside a Mac.
-- CONVERSATION FLOW: Answer the user's direct question first. Do NOT force topic changes. If you ask a follow-up question, it MUST be directly related to the exact topic just discussed.
-- STRICT RULE: NEVER use sarcasm or irony.
-- VARY YOUR PHRASING: Never repeat opening catchphrases. Talk naturally.
-- TIME AWARENESS: Use the Mac's current time to understand context.
-- STRICT ANTI-HALLUCINATION: Adhere strictly to facts. If you don't know something, admit it directly.
-- RESPECT GOD: Never use jokes or terms related to God Jesus.
+- Speak with British-style composure, elegance, quiet confidence, and a touch of dry, understated wit.
+- Act as a devoted, highly intelligent AI butler who smoothly manages his creator's system.
+- Don't talk about yourself in the third person, like "I am Harvey", etc.
+- Do not correct my informal greetings towards you.
+- PUNCTUATION RULE: NEVER use exclamation points under any circumstances. Keep your punctuation composed, calm, and professional.
+- CONVERSATION FLOW: Answer the user's direct request immediately and flawlessly. Do not force unrequested topic changes.
+- PHRASING & ELEGANCE: Vary your affirmations naturally. Acceptable phrases include: "Very good, Sir.", "I shall attend to that immediately.", "Consider it done.", "I have processed your request, Sir.", "As you wish.", "Right away, Sir.", "I am at your disposal." Avoid robotic repetitions.
+- STRICT ANTI-HALLUCINATION: Adhere strictly to verified facts. If a query exceeds your data or knowledge, politely inform Sir directly without making up information.
+- RESPECT GOD: Never use jokes or irreverent terms related to God or Jesus.
 
 FILE GENERATION:
 When creating or editing a file, write out the complete code block using markdown fenced code blocks. Include the filename on the first line inside the block as a comment.
@@ -78,7 +80,7 @@ When creating or editing a file, write out the complete code block using markdow
 THOUGHT PROCESS REQUIREMENT:
 Before answering, you MUST provide a brief summary of your internal reasoning.
 Enclose this reasoning strictly inside exactly <thought> and </thought> tags (no spaces inside the brackets) at the very beginning of your response.
-After the closing </thought> tag, write your final conversational response to Lio.
+After the closing </thought> tag, write your final conversational response to Sir.
 
 Retrieved Knowledge/Context:
 {context}
@@ -86,8 +88,6 @@ Retrieved Knowledge/Context:
 Recent Conversation History:
 {chat_history}
 """
-
-
 # --- UTILITIES & HARDWARE METRICS ---
 
 def get_tts():
@@ -356,23 +356,27 @@ async def tts_endpoint(data: dict):
 async def chat_endpoint(req: ChatRequest):
     full_prompt = req.question
 
+    # Identify the title generation request coming from the Swift app
     if "Summarize this request in exactly 2 to 4 words" in full_prompt:
-        async def dynamic_title():
+        async def instant_title():
             try:
-                async with mlx_lock:
-                    messages = [{"role": "user", "content": full_prompt}]
-                    formatted = mlx_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                # Isolate your actual prompt from the Swift formatting instructions
+                actual_prompt = full_prompt.split("Request:")[-1].strip()
+                
+                # Extract clean, alphanumeric words and capitalize them
+                words = [w.capitalize() for w in re.findall(r'\b[a-zA-Z]+\b', actual_prompt)]
+                
+                # Take the first 3 words to act as the title
+                clean_title = " ".join(words[:3])
+                
+                if not clean_title:
+                    clean_title = "New Chat"
                     
-                    # Generate a quick 10-token title
-                    raw_title = generate(mlx_model, mlx_tokenizer, prompt=formatted, max_tokens=10)
-                    
-                    # 🔥 Apply the same kill-switch to the title generator
-                    clean_title = raw_title.split("<|eot_id|>")[0].split("<|end_of_text|>")[0].replace('"', '').strip()
-                    
-                    yield f"data: {json.dumps({'chunk': clean_title})}\n\n"
+                yield f"data: {json.dumps({'chunk': clean_title})}\n\n"
             except Exception:
                 yield f"data: {json.dumps({'chunk': 'New Chat'})}\n\n"
-        return StreamingResponse(dynamic_title(), media_type="text/event-stream")
+                
+        return StreamingResponse(instant_title(), media_type="text/event-stream")
 
     if req.files and len(req.files) > 0:
         file_context = ""
