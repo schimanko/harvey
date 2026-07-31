@@ -53,22 +53,22 @@ class ServerManager {
 
     func startServer() {
         guard process == nil else { return }
-        
+
         let killTask = Process()
         killTask.launchPath = "/usr/bin/pkill"
-        killTask.arguments = ["-f", "server.py"]
+        killTask.arguments = ["-f", "harvey.py"]
         try? killTask.run()
         killTask.waitUntilExit()
 
         let p = Process()
         let pythonPath = "/Users/lio/Documents/Projects/harvey/.venv/bin/python"
-        let scriptPath = "/Users/lio/Documents/Projects/harvey/server.py"
+        let scriptPath = "/Users/lio/Documents/Projects/harvey/harvey.py"
         let workDir = "/Users/lio/Documents/Projects/harvey"
 
         p.executableURL = URL(fileURLWithPath: pythonPath)
         p.arguments = [scriptPath]
         p.currentDirectoryURL = URL(fileURLWithPath: workDir)
-        
+
         var env = ProcessInfo.processInfo.environment
         env["PYTHONUNBUFFERED"] = "1"
         env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:" + (env["PATH"] ?? "")
@@ -92,10 +92,10 @@ class ServerManager {
 
         do {
             try p.run()
-            self.process = p
+            process = p
         } catch {
             Task { @MainActor in
-                self.viewModel?.logDebug("❌ Failed to start server.py: \(error.localizedDescription)")
+                self.viewModel?.logDebug("❌ Failed to start Harvey's brain at harvey.py: \(error.localizedDescription)")
             }
         }
     }
@@ -359,8 +359,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         UNUserNotificationCenter.current().add(request) { _ in }
     }
     
-    func startMetricsPolling() {
-        metricsTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+      func startMetricsPolling() {
+        // Changed to 10.0 seconds to allow the Mac's efficiency cores to sleep
+        metricsTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self, self.isMetricsMode else { return }
                 await self.fetchMetrics()
@@ -431,54 +432,74 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
     
     private func streamResponse(sessionIndex: Int, messageIndex: Int, prompt: String, files: [AttachedFileItem]) async {
+        // Always clear spinner and save when we exit this function
+        defer {
+            Task { @MainActor in
+                self.isGenerating = false
+                self.scrollTrigger = UUID()
+                self.saveSessionsToDisk()
+            }
+        }
+
         guard let url = URL(string: "http://127.0.0.1:8000/api/chat") else {
-            isGenerating = false
+            sessions[sessionIndex].messages[messageIndex].content = "Connection failed. Invalid chat URL."
             return
         }
-        
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
+
         let historyMessages = sessions[sessionIndex].messages.prefix(max(0, messageIndex - 1))
         let recentHistory = historyMessages.suffix(16)
         let formattedHistory = recentHistory.map { msg in
             let roleName = msg.role == "user" ? "Lio" : "Harvey"
             return "\(roleName): \(msg.content)"
         }.joined(separator: "\n")
-        
-        var body: [String: Any] = ["question": prompt, "chat_history": formattedHistory]
+
+        var body: [String: Any] = [
+            "question": prompt,
+            "chat_history": formattedHistory
+        ]
+
         if !files.isEmpty {
             let filesPayload = files.map { ["name": $0.name, "content": $0.content] }
             body["files"] = filesPayload
         }
-        
+
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        
+
         do {
             let (bytes, response) = try await URLSession.shared.bytes(for: request)
             if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
-                isGenerating = false
+                sessions[sessionIndex].messages[messageIndex].content = "Harvey's sleeping. Is harvey.py active?"
                 return
             }
-            
+
             var rawAccumulated = ""
             var lastRenderTime = Date()
-            
+
             for try await line in bytes.lines {
                 if line.hasPrefix("data: ") {
                     let jsonString = String(line.dropFirst(6))
                     if let data = jsonString.data(using: .utf8),
                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        
+
                         if let toastText = json["toast"] as? String {
                             triggerNativeNotification(toastText)
+                        } else if let errorText = json["error"] as? String {
+                            rawAccumulated += "\n\n⚠️ **Backend Error:** \(errorText)"
+                            self.logDebug("Backend Error: \(errorText)")
                         } else if let chunk = json["chunk"] as? String {
                             rawAccumulated += chunk
-                            
+
                             let now = Date()
                             if now.timeIntervalSince(lastRenderTime) > 0.15 {
-                                parseThoughtAndContent(raw: rawAccumulated, sessionIndex: sessionIndex, messageIndex: messageIndex)
+                                parseThoughtAndContent(
+                                    raw: rawAccumulated,
+                                    sessionIndex: sessionIndex,
+                                    messageIndex: messageIndex
+                                )
                                 scrollTrigger = UUID()
                                 lastRenderTime = now
                             }
@@ -486,19 +507,25 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     }
                 }
             }
-            parseThoughtAndContent(raw: rawAccumulated, sessionIndex: sessionIndex, messageIndex: messageIndex)
-            scrollTrigger = UUID()
-            saveSessionsToDisk()
-            
+
+            // Final parse after streaming ends
+            if !rawAccumulated.isEmpty {
+                parseThoughtAndContent(
+                    raw: rawAccumulated,
+                    sessionIndex: sessionIndex,
+                    messageIndex: messageIndex
+                )
+                scrollTrigger = UUID()
+            }
+
             if isCallMode {
                 let finalAnswer = sessions[sessionIndex].messages[messageIndex].content
                 await speakText(finalAnswer)
             }
-            
+
         } catch {
-            sessions[sessionIndex].messages[messageIndex].content = "Connection failed. Is server.py active?"
+            sessions[sessionIndex].messages[messageIndex].content = "Harvey's sleeping. Is harvey.py active?"
         }
-        isGenerating = false
     }
     
     private func parseThoughtAndContent(raw: String, sessionIndex: Int, messageIndex: Int) {
@@ -577,7 +604,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
     
     func generateTitle(for sessionId: UUID, prompt: String) async {
-        guard let url = URL(string: "[http://127.0.0.1:8000/api/chat](http://127.0.0.1:8000/api/chat)") else { return }
+        guard let url = URL(string: "http://127.0.0.1:8000/api/chat") else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1361,7 +1388,7 @@ struct MessageBubbleView: View {
                                 }
                             }
                         }
-                    } else if message.thought.isEmpty {
+                    } else if message.thought.isEmpty && vm.isGenerating {
                         ProgressView()
                             .scaleEffect(0.7)
                             .padding(8)

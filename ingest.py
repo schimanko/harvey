@@ -1,10 +1,12 @@
 import os
 import json
+import time
 from tqdm import tqdm
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings
+# Replace OllamaEmbeddings with direct native execution via HuggingFace
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
 DATA_DIR = "./data"
 MEMORIES_DIR = "./memories"
@@ -66,7 +68,7 @@ def build_brain():
 
     manifest = load_manifest()
     all_files = get_all_supported_files()
-    
+
     files_to_process = []
     for fp in all_files:
         current_mtime = os.path.getmtime(fp)
@@ -74,18 +76,18 @@ def build_brain():
             files_to_process.append((fp, current_mtime))
 
     if not files_to_process:
-        print("✨ Everything is already up to date! No new or modified documents to ingest.")
+        print("âœ¨ Everything is already up to date! No new or modified documents to ingest.")
         return
 
-    print(f"📚 Found {len(files_to_process)} new/updated file(s) out of {len(all_files)} total.")
-    print("🔪 Extracting text and slicing into optimized chunks...")
-    
+    print(f"ðŸ“š Found {len(files_to_process)} new/updated file(s) out of {len(all_files)} total.")
+    print("ðŸ”ª Extracting text and slicing into optimized chunks...")
+
     all_chunks = []
     for fp, mtime in files_to_process:
         try:
             domain = get_domain_from_path(fp)
             ext = os.path.splitext(fp)[1].lower()
-            
+
             if ext == ".pdf":
                 loader = PyPDFLoader(fp)
                 docs = loader.load()
@@ -97,34 +99,42 @@ def build_brain():
 
             for chunk in chunks:
                 chunk.metadata["domain"] = domain
-                
+
             all_chunks.extend(chunks)
-            print(f"  📄 [{domain.upper()}] {os.path.basename(fp)} -> {len(chunks)} chunks")
+            print(f" ðŸ“„ [{domain.upper()}] {os.path.basename(fp)} -> {len(chunks)} chunks")
         except Exception as e:
-            print(f"⚠️ Could not read {fp}: {e}")
+            print(f"âš ï¸ Could not read {fp}: {e}")
 
     if not all_chunks:
-        print("⚠️ No readable text found in the updated files.")
+        print("âš ï¸ No readable text found in the updated files.")
         return
 
-    print(f"\n🧠 Processing {len(all_chunks)} total chunks with nomic-embed-text...")
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    
+    print(f"\nðŸ§  Processing {len(all_chunks)} total chunks with native HuggingFace embeddings...")
+    # Using local HF embeddings directly instead of routing through Ollama
+    embeddings = HuggingFaceEmbeddings(
+        model_name="nomic-ai/nomic-embed-text-v1.5", 
+        model_kwargs={"trust_remote_code": True}
+    )
+
     db = Chroma(embedding_function=embeddings, persist_directory=DB_DIR)
-    
-    # --- TURBO INGESTION (NO THROTTLING) ---
-    batch_size = 250
-    
-    print("🚀 Turbo Ingestion Active (No thermal throttling)...")
+
+    # --- THERMAL SAFE INGESTION (THROTTLED FOR M4 AIR) ---
+    # Dropped batch size to 32 to prevent GPU/Neural Engine from heat-soaking the fanless chassis
+    batch_size = 32
+
+    print("â„ï¸ Thermal-safe Ingestion Active (Pacing batches to keep Mac cool)...")
     for i in tqdm(range(0, len(all_chunks), batch_size), desc="Ingesting Batches", unit="batch"):
         batch = all_chunks[i : i + batch_size]
         db.add_documents(batch)
-    
+        
+        # Give the unified memory and logic blocks a split second to clear
+        time.sleep(0.05) 
+
     for fp, mtime in files_to_process:
         manifest[fp] = mtime
     save_manifest(manifest)
 
-    print("\n✅ Ingestion complete! Harvey's brain updated at maximum speed.")
+    print("\nâœ… Ingestion complete! Harvey's brain updated efficiently and safely.")
 
 if __name__ == "__main__":
     build_brain()
