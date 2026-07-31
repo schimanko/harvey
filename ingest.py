@@ -1,3 +1,4 @@
+# ingest.py
 import os
 import json
 import time
@@ -5,7 +6,6 @@ from tqdm import tqdm
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-# Replace OllamaEmbeddings with direct native execution via HuggingFace
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
 DATA_DIR = "./data"
@@ -27,6 +27,13 @@ PDF_SPLITTER = RecursiveCharacterTextSplitter(
     separators=["\n\n", "\n", ". ", " ", ""]
 )
 
+# Code Splitter designed to keep functions and classes intact
+CODE_SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=150,
+    separators=["\nclass ", "\ndef ", "\nfunc ", "\n\n", "\n", " ", ""]
+)
+
 def load_manifest():
     if os.path.exists(MANIFEST_FILE):
         try:
@@ -42,20 +49,35 @@ def save_manifest(manifest):
 
 def get_all_supported_files():
     files = []
-    for root_dir in [DATA_DIR, MEMORIES_DIR]:
+    # Scan data, memories, and the root directory for Harvey's codebase
+    for root_dir in [DATA_DIR, MEMORIES_DIR, "."]:
         if not os.path.exists(root_dir):
             continue
         for root, _, filenames in os.walk(root_dir):
+            
+            # Prevent scanning virtual environments, git metadata, caches, or the DB itself
+            if any(ignored in root for ignored in [".venv", "chroma_db", ".git", "__pycache__"]):
+                continue
+                
             for fn in filenames:
+                # Explicitly ignore the manifest file so Harvey doesn't ingest it
+                if fn == "ingested_manifest.json":
+                    continue
+                    
                 full_path = os.path.join(root, fn)
                 ext = os.path.splitext(fn)[1].lower()
-                if ext in [".pdf", ".txt", ".md", ".mdx"]:
+                # Includes architecture code and extension files
+                if ext in [".pdf", ".txt", ".md", ".mdx", ".py", ".swift", ".js", ".ts", ".jsx", ".tsx", ".json"]:
                     files.append(full_path)
     return files
 
 def get_domain_from_path(file_path):
     path_lower = file_path.lower()
     
+    # Tag Harvey's own codebase & extension as architecture
+    if any(file_path.endswith(ext) for ext in [".py", ".swift", ".js", ".ts", ".jsx", ".tsx"]) or "harvey-extension" in path_lower:
+        return "architecture"
+        
     if any(k in path_lower for k in ["mdn", "javascript", "typescript", "python", "github", "vscode", "wcag", "semver"]):
         return "web_dev"
     if any(k in path_lower for k in ["nng", "pucrs", "figma", "miro", "graphic_design", "books_ux", "heuristics"]):
@@ -76,11 +98,11 @@ def build_brain():
             files_to_process.append((fp, current_mtime))
 
     if not files_to_process:
-        print("âœ¨ Everything is already up to date! No new or modified documents to ingest.")
+        print("✨ Everything is already up to date! No new or modified documents to ingest.")
         return
 
-    print(f"ðŸ“š Found {len(files_to_process)} new/updated file(s) out of {len(all_files)} total.")
-    print("ðŸ”ª Extracting text and slicing into optimized chunks...")
+    print(f"📚 Found {len(files_to_process)} new/updated file(s) out of {len(all_files)} total.")
+    print("🔪 Extracting text and slicing into optimized chunks...")
 
     all_chunks = []
     for fp, mtime in files_to_process:
@@ -92,25 +114,35 @@ def build_brain():
                 loader = PyPDFLoader(fp)
                 docs = loader.load()
                 chunks = PDF_SPLITTER.split_documents(docs)
+            elif ext in [".py", ".swift", ".js", ".ts", ".jsx", ".tsx"]:
+                loader = TextLoader(fp, encoding="utf-8")
+                docs = loader.load()
+                chunks = CODE_SPLITTER.split_documents(docs)
             else:
                 loader = TextLoader(fp, encoding="utf-8")
                 docs = loader.load()
                 chunks = MD_SPLITTER.split_documents(docs)
 
+            file_name = os.path.basename(fp)
             for chunk in chunks:
                 chunk.metadata["domain"] = domain
+                # Prepend source header into content to anchor vector embeddings
+                if domain == "architecture":
+                    chunk.page_content = f"[HARVEY LIVE SOURCE CODE - File: {file_name}]\n{chunk.page_content}"
+                else:
+                    chunk.page_content = f"[File: {file_name}]\n{chunk.page_content}"
 
             all_chunks.extend(chunks)
-            print(f" ðŸ“„ [{domain.upper()}] {os.path.basename(fp)} -> {len(chunks)} chunks")
+            print(f" 📄 [{domain.upper()}] {os.path.basename(fp)} -> {len(chunks)} chunks")
         except Exception as e:
-            print(f"âš ï¸ Could not read {fp}: {e}")
+            print(f"⚠️  Could not read {fp}: {e}")
 
     if not all_chunks:
-        print("âš ï¸ No readable text found in the updated files.")
+        print("⚠️  No readable text found in the updated files.")
         return
 
-    print(f"\nðŸ§  Processing {len(all_chunks)} total chunks with native HuggingFace embeddings...")
-    # Using local HF embeddings directly instead of routing through Ollama
+    print(f"\n🧠 Processing {len(all_chunks)} total chunks with native HuggingFace embeddings...")
+    
     embeddings = HuggingFaceEmbeddings(
         model_name="nomic-ai/nomic-embed-text-v1.5", 
         model_kwargs={"trust_remote_code": True}
@@ -118,23 +150,19 @@ def build_brain():
 
     db = Chroma(embedding_function=embeddings, persist_directory=DB_DIR)
 
-    # --- THERMAL SAFE INGESTION (THROTTLED FOR M4 AIR) ---
-    # Dropped batch size to 32 to prevent GPU/Neural Engine from heat-soaking the fanless chassis
     batch_size = 32
 
-    print("â„ï¸ Thermal-safe Ingestion Active (Pacing batches to keep Mac cool)...")
+    print("❄️  Thermal-safe Ingestion Active (Pacing batches to keep Mac cool)...")
     for i in tqdm(range(0, len(all_chunks), batch_size), desc="Ingesting Batches", unit="batch"):
         batch = all_chunks[i : i + batch_size]
         db.add_documents(batch)
-        
-        # Give the unified memory and logic blocks a split second to clear
         time.sleep(0.05) 
 
     for fp, mtime in files_to_process:
         manifest[fp] = mtime
     save_manifest(manifest)
 
-    print("\nâœ… Ingestion complete! Harvey's brain updated efficiently and safely.")
+    print("\n✅ Ingestion complete! Harvey's brain updated efficiently and safely.")
 
 if __name__ == "__main__":
     build_brain()

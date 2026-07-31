@@ -25,6 +25,9 @@ struct ChatMessage: Identifiable, Codable {
     var content: String
     var thought: String = ""
     var attachedFiles: [String] = []
+    var sources: [String] = [] 
+    var pendingSearch: String? = nil
+    var pendingAction: String? = nil
     var timestamp = Date()
 }
 
@@ -122,7 +125,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var showCodeSidebar: Bool = false
     @Published var sessions: [ChatSession] = []
     
-    // 🔥 NEW: Set-based selection for multi-select
     @Published var selectedSessionIds: Set<UUID> = []
     
     @Published var inputMessage: String = ""
@@ -132,7 +134,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var isMetricsMode: Bool = false
     @Published var debugLogs: [String] = []
     @Published var metrics: HardwareMetricsData = HardwareMetricsData()
-    // 🔥 NEW: Store the last 60 seconds of data
     @Published var cpuHistory: [MetricPoint] = []
     @Published var ramHistory: [MetricPoint] = []
     @Published var scrollTrigger: UUID = UUID()
@@ -313,7 +314,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         saveSessionsToDisk()
     }
 
-    // 🔥 NEW: Batch Delete Handler
     func deleteSelectedSessions() {
         sessions.removeAll { selectedSessionIds.contains($0.id) }
         selectedSessionIds.removeAll()
@@ -382,19 +382,16 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         UNUserNotificationCenter.current().add(request) { _ in }
     }
     
-    // 🔥 NEW: Hard kill/start the timer to save Mac battery
     func toggleMetricsMode() {
         isMetricsMode.toggle()
         
         if isMetricsMode {
-            // Start polling every 1 second
             metricsTimer?.invalidate()
             metricsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
                 Task { @MainActor in await self?.fetchMetrics() }
             }
-            Task { await fetchMetrics() } // Initial fetch
+            Task { await fetchMetrics() }
         } else {
-            // Kill the timer completely and wipe memory arrays
             metricsTimer?.invalidate()
             metricsTimer = nil
             cpuHistory.removeAll()
@@ -409,14 +406,12 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             if let decoded = try? JSONDecoder().decode(HardwareMetricsData.self, from: data) {
                 self.metrics = decoded
                 
-                // Parse strings like "12.5%" into pure Doubles for the graph
                 let cpuStr = decoded.sys_cpu.replacingOccurrences(of: "%", with: "")
                 let ramStr = decoded.sys_ram_gb.replacingOccurrences(of: " GB", with: "")
                 
                 self.cpuHistory.append(MetricPoint(value: Double(cpuStr) ?? 0))
                 self.ramHistory.append(MetricPoint(value: Double(ramStr) ?? 0))
                 
-                // Keep only the last 60 seconds (60 points) to prevent memory bloat
                 if self.cpuHistory.count > 60 { self.cpuHistory.removeFirst() }
                 if self.ramHistory.count > 60 { self.ramHistory.removeFirst() }
             }
@@ -462,6 +457,97 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 files: sentFiles
             )
         }
+    }
+    
+    func executeTool(type: String, query: String, messageId: UUID) {
+        guard let id = selectedSessionIds.first, let sessionIndex = sessions.firstIndex(where: { $0.id == id }) else { return }
+        
+        // Clear the pending UI button
+        if let msgIndex = sessions[sessionIndex].messages.firstIndex(where: { $0.id == messageId }) {
+            sessions[sessionIndex].messages[msgIndex].pendingSearch = nil
+            sessions[sessionIndex].messages[msgIndex].pendingAction = nil
+        }
+        
+        let endpoint = type == "search" ? "search" : "action"
+        let payloadKey = type == "search" ? "query" : "command"
+        
+        Task {
+            guard let url = URL(string: "http://127.0.0.1:8000/api/\(endpoint)") else { return }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try? JSONSerialization.data(withJSONObject: [payloadKey: query])
+            
+            do {
+                let (data, _) = try await URLSession.shared.data(for: request)
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let resultText = json["result"] as? String {
+                    
+                    await MainActor.run {
+                        let contextPrefix = type == "search" ? "Here are the private web search results:\n" : "Here is the terminal output:\n"
+                        // Create a hidden prompt that the UI never sees
+                        let hiddenPrompt = "\(contextPrefix)\(resultText)\n\nPlease provide your final response to Sir based on this data."
+                        
+                        // 🔥 FIX: Skip creating a User bubble. Just create Harvey's bubble directly.
+                        self.sessions[sessionIndex].messages.append(ChatMessage(role: "assistant", content: ""))
+                        let assistantMsgIndex = self.sessions[sessionIndex].messages.count - 1
+                        
+                        self.isGenerating = true
+                        self.scrollTrigger = UUID()
+                        self.saveSessionsToDisk()
+                        
+                        // Stream the response using the hidden prompt
+                        Task {
+                            await self.streamResponse(
+                                sessionIndex: sessionIndex,
+                                messageIndex: assistantMsgIndex,
+                                prompt: hiddenPrompt,
+                                files: []
+                            )
+                        }
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    let hiddenPrompt = "The \(type) failed. Please apologize and proceed without it."
+                    
+                    self.sessions[sessionIndex].messages.append(ChatMessage(role: "assistant", content: ""))
+                    let assistantMsgIndex = self.sessions[sessionIndex].messages.count - 1
+                    
+                    self.isGenerating = true
+                    self.scrollTrigger = UUID()
+                    
+                    Task {
+                        await self.streamResponse(
+                            sessionIndex: sessionIndex,
+                            messageIndex: assistantMsgIndex,
+                            prompt: hiddenPrompt,
+                            files: []
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    func openFileInFinder(filename: String) {
+        // Harvey's working directory
+        let basePath = "/Users/lio/Documents/Projects/harvey"
+        guard let enumerator = FileManager.default.enumerator(atPath: basePath) else { return }
+        
+        for case let path as String in enumerator {
+            // Ignore system, cache, and DB folders to speed up the search
+            if path.hasSuffix(filename) && !path.contains(".venv") && !path.contains("chroma_db") && !path.contains(".git") && !path.contains("__pycache__") {
+                
+                let fullPath = URL(fileURLWithPath: basePath).appendingPathComponent(path)
+                // Highlights the exact file in Finder
+                NSWorkspace.shared.selectFile(fullPath.path, inFileViewerRootedAtPath: basePath)
+                return
+            }
+        }
+        
+        // Fallback: Just open the root project folder if the file isn't found
+        NSWorkspace.shared.open(URL(fileURLWithPath: basePath))
     }
     
     func regenerateResponse(for messageId: UUID) {
@@ -564,39 +650,65 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
     
     private func parseThoughtAndContent(raw: String, sessionIndex: Int, messageIndex: Int) {
-        let cleanRaw = raw.replacingOccurrences(
+        var cleanRaw = raw.replacingOccurrences(
             of: "(?s)<file name=\"[^\"]+\">",
             with: "",
             options: .regularExpression
         ).replacingOccurrences(of: "</file>", with: "")
         
-        let pattern = #"(?i)<(thought|summary|think)>(.*?)</\1>"#
-        if let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) {
+        // 1. Extract the reasoning block
+        let thoughtPattern = #"(?i)<(?:thought|summary|think)>(.*?)</(?:thought|summary|think)>"#
+        if let regex = try? NSRegularExpression(pattern: thoughtPattern, options: [.dotMatchesLineSeparators]) {
             let nsString = cleanRaw as NSString
-            let matches = regex.matches(in: cleanRaw, options: [], range: NSRange(location: 0, length: nsString.length))
-            
-            if let firstMatch = matches.first {
-                let thoughtRange = firstMatch.range(at: 2)
-                let extractedThought = nsString.substring(with: thoughtRange).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-                let postTagIndex = firstMatch.range.location + firstMatch.range.length
-                let extractedContent = nsString.substring(from: postTagIndex).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-                
-                sessions[sessionIndex].messages[messageIndex].thought = extractedThought
-                sessions[sessionIndex].messages[messageIndex].content = extractedContent
-                return
+            if let match = regex.matches(in: cleanRaw, options: [], range: NSRange(location: 0, length: nsString.length)).first {
+                sessions[sessionIndex].messages[messageIndex].thought = nsString.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let postTagIndex = match.range.location + match.range.length
+                cleanRaw = nsString.substring(from: postTagIndex)
             }
         }
         
-        if cleanRaw.contains("<thought>") || cleanRaw.contains("<summary>") || cleanRaw.contains("<think>") {
-            let cleanThought = cleanRaw
-                .replacingOccurrences(of: "<thought>", with: "")
-                .replacingOccurrences(of: "<summary>", with: "")
-                .replacingOccurrences(of: "<think>", with: "")
-            sessions[sessionIndex].messages[messageIndex].thought = cleanThought.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-            sessions[sessionIndex].messages[messageIndex].content = ""
-        } else {
-            sessions[sessionIndex].messages[messageIndex].content = cleanRaw
+        // 2. Strict Sanitization: Kill any escaping thought tags that missed the regex
+        cleanRaw = cleanRaw
+            .replacingOccurrences(of: "</thought>", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "<thought>", with: "", options: .caseInsensitive)
+
+        // 3. Native UI Integration: Extract <source> tags
+        var parsedSources: [String] = []
+        let sourcePattern = #"(?i)<source>(.*?)</source>"#
+        if let regex = try? NSRegularExpression(pattern: sourcePattern, options: []) {
+            let nsString = cleanRaw as NSString
+            let matches = regex.matches(in: cleanRaw, options: [], range: NSRange(location: 0, length: nsString.length))
+            
+            for match in matches {
+                let sourceName = nsString.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !parsedSources.contains(sourceName) {
+                    parsedSources.append(sourceName)
+                }
+            }
+            cleanRaw = regex.stringByReplacingMatches(in: cleanRaw, options: [], range: NSRange(location: 0, length: nsString.length), withTemplate: "")
         }
+        
+        // 4. Intercept Search and Action Requests
+        let searchPattern = #"\[REQUEST_SEARCH:\s*"(.*?)"\]"#
+        if let regex = try? NSRegularExpression(pattern: searchPattern, options: []) {
+            let nsString = cleanRaw as NSString
+            if let match = regex.matches(in: cleanRaw, options: [], range: NSRange(location: 0, length: nsString.length)).first {
+                sessions[sessionIndex].messages[messageIndex].pendingSearch = nsString.substring(with: match.range(at: 1))
+                cleanRaw = regex.stringByReplacingMatches(in: cleanRaw, options: [], range: NSRange(location: 0, length: nsString.length), withTemplate: "")
+            }
+        }
+        
+        let actionPattern = #"\[REQUEST_ACTION:\s*"(.*?)"\]"#
+        if let regex = try? NSRegularExpression(pattern: actionPattern, options: []) {
+            let nsString = cleanRaw as NSString
+            if let match = regex.matches(in: cleanRaw, options: [], range: NSRange(location: 0, length: nsString.length)).first {
+                sessions[sessionIndex].messages[messageIndex].pendingAction = nsString.substring(with: match.range(at: 1))
+                cleanRaw = regex.stringByReplacingMatches(in: cleanRaw, options: [], range: NSRange(location: 0, length: nsString.length), withTemplate: "")
+            }
+        }
+        
+        sessions[sessionIndex].messages[messageIndex].sources = parsedSources
+        sessions[sessionIndex].messages[messageIndex].content = cleanRaw.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func parseBlocks(raw: String) -> [ContentBlock] {
@@ -995,7 +1107,6 @@ struct MainView: View {
                 }
                 .padding([.horizontal, .top])
 
-                // 🔥 NEW: Set Selection enabled
                 List(selection: $vm.selectedSessionIds) {
                     ForEach(vm.filteredSessions) { session in
                         SidebarItemView(
@@ -1030,7 +1141,6 @@ struct MainView: View {
             }
             .frame(minWidth: 180, idealWidth: 200)
         } detail: {
-            // 🔥 NEW: Multi-Select Deletion View vs Standard Chat View
             if vm.selectedSessionIds.count > 1 {
                 VStack(spacing: 20) {
                     Image(systemName: "trash.circle.fill")
@@ -1342,7 +1452,7 @@ struct HardwareMetricsView: View {
                             y: .value("CPU", point.value)
                         )
                         .foregroundStyle(Color.blue.gradient)
-                        .interpolationMethod(.catmullRom) // Smooth curves
+                        .interpolationMethod(.catmullRom) 
                         
                         AreaMark(
                             x: .value("Time", point.time),
@@ -1372,7 +1482,7 @@ struct HardwareMetricsView: View {
                         .foregroundStyle(LinearGradient(colors: [Color.purple.opacity(0.3), .clear], startPoint: .top, endPoint: .bottom))
                         .interpolationMethod(.catmullRom)
                     }
-                    .chartYScale(domain: 0...24) // Assuming Mac is ~16GB-24GB max
+                    .chartYScale(domain: 0...24)
                     .chartXAxis(.hidden)
                 }
             }
@@ -1548,6 +1658,73 @@ struct MessageBubbleView: View {
                     .font(.caption)
                     .padding(.top, 2)
                     .padding(.leading, 6)
+                }
+                
+                if !isUser && !message.sources.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(message.sources, id: \.self) { source in
+                            Button(action: {
+                                vm.openFileInFinder(filename: source)
+                            }) {
+                                Text(source)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 4)
+                                    .background(Color.gray.opacity(0.15))
+                                    .foregroundColor(.secondary)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .onHover { hovering in
+                                // Optional: Change cursor to pointing hand on hover
+                                if hovering {
+                                    NSCursor.pointingHand.push()
+                                } else {
+                                    NSCursor.pop()
+                                }
+                            }
+                        }
+                        Spacer()
+                    }
+                    .padding(.top, 4)
+                }
+                
+                if !isUser && message.pendingSearch != nil {
+                    Button(action: {
+                        vm.executeTool(type: "search", query: message.pendingSearch!, messageId: message.id)
+                    }) {
+                        HStack {
+                            Image(systemName: "globe")
+                            Text("Allow Private Search: \"\(message.pendingSearch!)\"")
+                        }
+                        .font(.system(size: 12, weight: .bold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.blue)
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 6)
+                }
+                
+                if !isUser && message.pendingAction != nil {
+                    Button(action: {
+                        vm.executeTool(type: "action", query: message.pendingAction!, messageId: message.id)
+                    }) {
+                        HStack {
+                            Image(systemName: "terminal.fill")
+                            Text("Allow Terminal Action: \(message.pendingAction!)")
+                        }
+                        .font(.system(size: 12, weight: .bold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.orange)
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 6)
                 }
             }
             if !isUser { Spacer(minLength: 50) }
