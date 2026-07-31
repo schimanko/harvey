@@ -1,0 +1,42 @@
+# Secrets & Credentials
+.env
+*.env
+.netrc
+
+# AI Models & Large Binary Weights (>100MB)
+*.onnx
+*.bin
+kokoro-v1.0.onnx
+voices-v1.0.bin
+
+# Personal AI Data, Vector DBs & Memory State
+chroma_db/
+memories/
+data/
+ingested_manifest.json
+media/
+
+# Python Virtual Environments & Cache
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS, Swift & Xcode Build Artifacts
+.DS_Store
+.build/
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+*.xcodeproj/xcuserdata/
+
+# IDE & Editor Configs
+.vscode/
+*.swp
+
+# Extension Build Artifacts & Dependencies
+harvey-extension/node_modules/
+harvey-extension/dist/
+harvey-extension/out/
